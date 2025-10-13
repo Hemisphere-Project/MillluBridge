@@ -48,7 +48,7 @@ class MilluBridge:
             # OSC Status indicator
             with dpg.group(horizontal=True):
                 dpg.add_text("OSC Status:", tag="status_label")
-                dpg.add_text("●", tag="status_indicator", color=(255, 0, 0))  # Red by default
+                dpg.add_text("[X]", tag="status_indicator", color=(255, 0, 0))  # Red by default
                 dpg.add_text("", tag="status_text", color=(150, 150, 150))
             
             dpg.add_separator()
@@ -59,7 +59,7 @@ class MilluBridge:
                           borders_innerH=True, borders_outerH=True, 
                           borders_innerV=True, borders_outerV=True,
                           row_background=True, resizable=True):
-                dpg.add_table_column(label="Layer", width_fixed=True, init_width_or_weight=150)
+                dpg.add_table_column(label="Layers", width_fixed=True, init_width_or_weight=150)
                 dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=60)
                 dpg.add_table_column(label="Filename", width_stretch=True)
                 dpg.add_table_column(label="Position", width_fixed=True, init_width_or_weight=80)
@@ -238,7 +238,10 @@ class MilluBridge:
             else:
                 # Update existing row
                 state = layer_data["state"]
-                color = (0, 255, 0) if state == "playing" else (150, 150, 150)
+                if state == "playing": color = (0, 255, 0)
+                elif state == "paused": color = (255, 255, 0)
+                elif state == "stopped": color = (255, 0, 0)
+                else: color = (150, 150, 150)
                 
                 if dpg.does_item_exist(f"{row_tag}_state"):
                     dpg.set_value(f"{row_tag}_state", state.upper())
@@ -260,12 +263,18 @@ class MilluBridge:
     def update_osc_status(self, active):
         """Update the OSC status indicator"""
         if dpg.does_item_exist("status_indicator"):
-            color = (0, 255, 0) if active else (255, 0, 0)  # Green if active, red otherwise
-            dpg.configure_item("status_indicator", color=color)
+            if active:
+                dpg.set_value("status_indicator", "[OK]")
+                dpg.configure_item("status_indicator", color=(0, 255, 0))
+            else:
+                dpg.set_value("status_indicator", "[X]")
+                dpg.configure_item("status_indicator", color=(255, 0, 0))
+        
         if dpg.does_item_exist("status_text"):
             if active:
-                text = f"Receiving - {self.osc_address}:{self.osc_port}"
-                color = (0, 255, 0)
+                text = f"Receiving on {self.osc_address}:{self.osc_port}"
+                # color = (0, 255, 0)
+                color = (150, 150, 150)
             else:
                 if self.is_running:
                     text = f"Listening on {self.osc_address}:{self.osc_port}"
@@ -318,7 +327,7 @@ class MilluBridge:
                 self.osc_server.start()
                 self.last_osc_time = time.time()
                 self.update_osc_log(f"Bridge started on {self.osc_address}:{self.osc_port} -> {port_name}")
-                self.update_osc_status(True)
+                # self.update_osc_status(True)
                 
                 # Start status check thread
                 if self.status_check_thread is None or not self.status_check_thread.is_alive():
