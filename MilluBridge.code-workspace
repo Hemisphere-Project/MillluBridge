@@ -1,0 +1,19 @@
+{
+    "folders": [
+        {
+            "name": "MilluBridge (Root)",
+            "path": "."
+        },
+        {
+            "name": "Bridge (Python)",
+            "path": "Bridge"
+        },
+        {
+            "name": "Nowde (ESP32)",
+            "path": "Nowde"
+        }
+    ],
+    "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder:Bridge (Python)}/.venv/bin/python"
+    }
+}

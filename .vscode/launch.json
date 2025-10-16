@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Bridge Application",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Bridge/src/main.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Bridge",
+            "python": "${workspaceFolder}/Bridge/.venv/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/Bridge/src"
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${fileDirname}",
+            "python": "${workspaceFolder}/Bridge/.venv/bin/python"
+        }
+    ]
+}

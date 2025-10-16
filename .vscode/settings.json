@@ -1,0 +1,30 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/Bridge/.venv/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "python.envFile": "${workspaceFolder}/.env",
+    
+    // Auto-detect Python files in Bridge folder
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/Bridge/src"
+    ],
+    
+    // Set Bridge/src as root for imports
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/Bridge/src"
+    ],
+    
+    // Terminal settings
+    "terminal.integrated.cwd": "${workspaceFolder}/Bridge",
+    
+    // Format on save (optional)
+    "editor.formatOnSave": false,
+    
+    // File associations
+    "files.associations": {
+        "*.h": "cpp",
+        "*.cpp": "cpp"
+    },
+    
+    // PlatformIO settings for Nowde
+    "C_Cpp.default.configurationProvider": "platformio.platformio-ide"
+}

@@ -1,10 +1,97 @@
+# MilluBridge - Bridge Application
+# Copyright (C) 2025 maigre - Hemisphere Project
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import dearpygui.dearpygui as dpg
 from osc.server import OSCServer
 from midi.output_manager import OutputManager
 from midi.input_manager import InputManager
-from midi.message_sender import send_midi_message
 import time
 import threading
+import re
+
+class MediaSyncManager:
+    """Manages media synchronization state and throttling for each layer"""
+    
+    def __init__(self, output_manager, throttle_interval=0.1):
+        self.output_manager = output_manager
+        self.throttle_interval = throttle_interval  # seconds (default 10Hz = 0.1s)
+        self.layers_state = {}  # {layer_name: {index, position, state, last_sent_time, last_sent_index}}
+    
+    def parse_media_index(self, filename):
+        """Parse media index from filename (1-3 digits at start)"""
+        if not filename:
+            return 0
+        
+        # Match 1-3 digits at the start of filename
+        match = re.match(r'^(\d{1,3})_', filename)
+        if match:
+            index = int(match.group(1))
+            # Clamp to MIDI valid range (1-127, 0 reserved for stop)
+            return min(max(index, 1), 127)
+        return 0  # No index found
+    
+    def update_layer(self, layer_name, filename, position, duration, state):
+        """Update layer state and send MIDI if needed"""
+        current_time = time.time()
+        # Media index is always 0 when stopped, otherwise parse from filename
+        media_index = 0 if state == 'stopped' else self.parse_media_index(filename)
+        
+        # Initialize layer state if needed
+        if layer_name not in self.layers_state:
+            self.layers_state[layer_name] = {
+                'index': 0,
+                'position': 0.0,
+                'state': 'stopped',
+                'last_sent_time': 0,
+                'last_sent_index': -1
+            }
+        
+        layer_state = self.layers_state[layer_name]
+        
+        # Update state
+        layer_state['index'] = media_index
+        layer_state['position'] = position
+        layer_state['state'] = state
+        
+        # Determine if we should send (throttled updates for all states)
+        should_send = False
+        
+        # Send on index change (media change)
+        if media_index != layer_state['last_sent_index']:
+            should_send = True
+        # Throttled updates for all states (playing or stopped)
+        elif (current_time - layer_state['last_sent_time']) >= self.throttle_interval:
+            should_send = True
+        
+        if should_send:
+            # Send media sync via SysEx 0x05
+            position_ms = int(position * 1000)  # Convert to milliseconds
+            self.output_manager.send_media_sync(
+                layer_name=layer_name,
+                media_index=media_index,
+                position_ms=position_ms,
+                state=state
+            )
+            
+            layer_state['last_sent_time'] = current_time
+            layer_state['last_sent_index'] = media_index
+    
+    def set_throttle_interval(self, interval):
+        """Update throttle interval (in seconds)"""
+        self.throttle_interval = max(0.01, interval)  # Minimum 10ms
 
 class MilluBridge:
     def __init__(self, osc_address="127.0.0.1", osc_port=8000):
@@ -13,7 +100,6 @@ class MilluBridge:
         self.osc_server = None
         self.output_manager = OutputManager()
         self.input_manager = InputManager(
-            callback=self.handle_midi_input,
             sysex_callback=self.handle_sysex_message
         )
         self.selected_port = None
@@ -21,7 +107,9 @@ class MilluBridge:
         self.last_osc_time = 0
         self.status_check_thread = None
         self.midi_refresh_thread = None
+        self.media_sync_thread = None
         self.stop_midi_refresh = False
+        self.stop_media_sync = False
         self.current_nowde_device = None
         
         # Millumin layer tracking
@@ -35,6 +123,18 @@ class MilluBridge:
         # Layer editing modal state
         self.editing_layer_mac = None  # Track which device is being edited
         
+        # Media synchronization settings (configurable)
+        self.sync_settings = {
+            'mtc_framerate': 30,  # fps
+            'freewheel_timeout': 3.0,  # seconds
+            'clock_desync_threshold': 200,  # milliseconds
+            'throttle_interval': 0.1  # seconds (10Hz)
+        }
+        
+        # Media sync manager
+        self.media_sync = MediaSyncManager(self.output_manager, 
+                                          throttle_interval=self.sync_settings['throttle_interval'])
+        
         # Create DearPyGUI context
         dpg.create_context()
         
@@ -43,6 +143,9 @@ class MilluBridge:
         
         # Start MIDI device refresh thread
         self.start_midi_refresh_thread()
+        
+        # Start media sync thread for continuous updates
+        self.start_media_sync_thread()
         
         # Auto-start bridge
         self.start_bridge()
@@ -72,6 +175,36 @@ class MilluBridge:
             # OSC setup note (shown when not receiving)
             dpg.add_text("Note: You should enable OSC sender feedback in Millumin > Device Manager > OSC section", 
                         tag="osc_setup_note", color=(150, 150, 150))
+            
+            dpg.add_separator()
+            
+            # Media Sync Settings
+            dpg.add_text("Media Sync Settings", color=(150, 200, 255))
+            with dpg.group(horizontal=True):
+                dpg.add_text("Throttle (Hz):")
+                dpg.add_slider_int(tag="throttle_hz_slider", default_value=10, 
+                                  min_value=1, max_value=60, width=150,
+                                  callback=self.on_throttle_changed)
+                dpg.add_text("MTC Framerate:")
+                dpg.add_input_int(tag="mtc_framerate_input", 
+                                 default_value=self.sync_settings['mtc_framerate'],
+                                 width=60, step=0, on_enter=True,
+                                 callback=self.on_sync_setting_changed)
+                dpg.add_text("fps")
+            
+            with dpg.group(horizontal=True):
+                dpg.add_text("Freewheel Timeout:")
+                dpg.add_input_float(tag="freewheel_timeout_input",
+                                   default_value=self.sync_settings['freewheel_timeout'],
+                                   width=60, step=0, format="%.1f", on_enter=True,
+                                   callback=self.on_sync_setting_changed)
+                dpg.add_text("s")
+                dpg.add_text("   Desync Threshold:")
+                dpg.add_input_int(tag="desync_threshold_input",
+                                 default_value=self.sync_settings['clock_desync_threshold'],
+                                 width=60, step=0, on_enter=True,
+                                 callback=self.on_sync_setting_changed)
+                dpg.add_text("ms")
             
             # OSC Logs section (hidden by default)
             with dpg.group(tag="osc_logs_section", show=False):
@@ -130,16 +263,11 @@ class MilluBridge:
                           borders_innerH=True, borders_outerH=True, 
                           borders_innerV=True, borders_outerV=True,
                           row_background=True, resizable=True, height=150):
-                dpg.add_table_column(label="UUID", width_fixed=True, init_width_or_weight=100)
+                dpg.add_table_column(label="Nowde", width_fixed=True, init_width_or_weight=100)
                 dpg.add_table_column(label="Version", width_fixed=True, init_width_or_weight=80)
                 dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=80)
                 dpg.add_table_column(label="Layer", width_stretch=True)
 
-    def handle_midi_input(self, message, deltatime):
-        """Handle incoming MIDI messages from the device (for logging/debug only)"""
-        # Log the incoming MIDI message
-        self.log_midi_message(message, is_input=True)
-    
     def handle_sysex_message(self, msg_type, data):
         """Handle parsed SysEx messages from Nowde"""
         if msg_type == 'receiver_table':
@@ -319,14 +447,6 @@ class MilluBridge:
         # Log message (filtered or all)
         if self.show_all_messages or is_millumin:
             self.update_osc_log(message)
-        
-        # OSC to MIDI: Send MIDI output based on OSC message
-        if self.selected_port and self.is_running:
-            midi_message = self.map_osc_to_midi(message)
-            if midi_message:
-                send_midi_message(self.output_manager.midi_out, midi_message)
-                # Log the outgoing MIDI message
-                self.log_midi_message(midi_message, is_input=False)
     
     def parse_millumin_message(self, message):
         """Parse Millumin OSC messages and update layer tracking"""
@@ -398,9 +518,21 @@ class MilluBridge:
             
             elif route == "/mediaStopped" and len(args) >= 2:
                 # mediaStopped format: (index, filename, duration)
-                layer["filename"] = str(args[1]) if len(args) > 1 else ""
-                layer["duration"] = float(args[2]) if len(args) > 2 else 0.0
+                # Clear filename when stopped so media index will be 0
+                layer["filename"] = ""
+                layer["duration"] = 0.0
+                layer["position"] = 0.0  # Reset position to 0
                 layer["state"] = "stopped"
+            
+            # Send to media sync manager (always update, even for stopped state)
+            if self.current_nowde_device:
+                self.media_sync.update_layer(
+                    layer_name=layer_name,
+                    filename=layer["filename"],
+                    position=layer["position"],
+                    duration=layer["duration"],
+                    state=layer["state"]
+                )
             
             # Update UI table
             self.update_layers_table()
@@ -504,52 +636,6 @@ class MilluBridge:
                 dpg.show_item("nowde_logs_section")
                 dpg.set_value("nowde_logs_toggle_btn", "Hide Logs")
     
-    def on_subscribe_layer(self):
-        """Handle Subscribe to Layer button click"""
-        if not self.current_nowde_device:
-            self.update_osc_log("Error: No Nowde connected")
-            return
-        
-        layer_name = dpg.get_value("subscribe_layer_input")
-        if not layer_name or not layer_name.strip():
-            self.update_osc_log("Error: Please enter a layer name")
-            return
-        
-        # Send Subscribe to Layer SysEx
-        result = self.output_manager.send_subscribe_layer(layer_name.strip())
-        if result and result[0]:
-            success, formatted_msg = result
-            self.update_osc_log(f"Sent Subscribe to Layer: {layer_name.strip()}")
-            self.log_nowde_message(f"TX: {formatted_msg}")
-        else:
-            self.update_osc_log("Error: Failed to send Subscribe command")
-    
-    def log_midi_message(self, midi_message, is_input=False):
-        """Log MIDI message in a human-readable format"""
-        if dpg.does_item_exist("midi_log_text"):
-            current_log = dpg.get_value("midi_log_text")
-            
-            # Clear initial message on first real message
-            if current_log.strip() == "Waiting for MIDI messages...":
-                current_log = ""
-            
-            # Format MIDI message in human-readable form
-            direction = "IN " if is_input else "OUT"
-            formatted_msg = self.format_midi_message(midi_message)
-            timestamp = time.strftime("%H:%M:%S")
-            new_log = current_log + f"[{timestamp}] {direction}: {formatted_msg}\n"
-            
-            # Keep only last 1000 lines
-            lines = new_log.split('\n')
-            if len(lines) > 1000:
-                new_log = '\n'.join(lines[-1000:])
-            
-            dpg.set_value("midi_log_text", new_log)
-            
-            # Auto-scroll to bottom
-            if dpg.does_item_exist("midi_log_window"):
-                dpg.set_y_scroll("midi_log_window", dpg.get_y_scroll_max("midi_log_window"))
-    
     def log_nowde_message(self, message):
         """Log Nowde communication message (including SysEx)"""
         if dpg.does_item_exist("midi_log_text"):
@@ -572,60 +658,6 @@ class MilluBridge:
             # Auto-scroll to bottom
             if dpg.does_item_exist("midi_log_window"):
                 dpg.set_y_scroll("midi_log_window", dpg.get_y_scroll_max("midi_log_window"))
-    
-    def format_midi_message(self, midi_message):
-        """Format MIDI message bytes into human-readable string"""
-        if not midi_message or len(midi_message) == 0:
-            return "Empty message"
-        
-        status_byte = midi_message[0]
-        channel = (status_byte & 0x0F) + 1  # MIDI channels are 1-16
-        msg_type = status_byte & 0xF0
-        
-        # Note On (0x90)
-        if msg_type == 0x90 and len(midi_message) >= 3:
-            note = midi_message[1]
-            velocity = midi_message[2]
-            note_name = self.midi_note_to_name(note)
-            if velocity == 0:
-                return f"Note Off: {note_name} (Ch {channel}) - Raw: {list(midi_message)}"
-            return f"Note On: {note_name}, Vel={velocity} (Ch {channel}) - Raw: {list(midi_message)}"
-        
-        # Note Off (0x80)
-        elif msg_type == 0x80 and len(midi_message) >= 3:
-            note = midi_message[1]
-            velocity = midi_message[2]
-            note_name = self.midi_note_to_name(note)
-            return f"Note Off: {note_name}, Vel={velocity} (Ch {channel}) - Raw: {list(midi_message)}"
-        
-        # Control Change (0xB0)
-        elif msg_type == 0xB0 and len(midi_message) >= 3:
-            cc_num = midi_message[1]
-            value = midi_message[2]
-            return f"CC: {cc_num}, Value={value} (Ch {channel}) - Raw: {list(midi_message)}"
-        
-        # Program Change (0xC0)
-        elif msg_type == 0xC0 and len(midi_message) >= 2:
-            program = midi_message[1]
-            return f"Program Change: {program} (Ch {channel}) - Raw: {list(midi_message)}"
-        
-        # Pitch Bend (0xE0)
-        elif msg_type == 0xE0 and len(midi_message) >= 3:
-            lsb = midi_message[1]
-            msb = midi_message[2]
-            value = (msb << 7) | lsb
-            return f"Pitch Bend: {value} (Ch {channel}) - Raw: {list(midi_message)}"
-        
-        # Unknown or other message types
-        else:
-            return f"Raw MIDI: {list(midi_message)}"
-    
-    def midi_note_to_name(self, note_number):
-        """Convert MIDI note number to note name (e.g., 60 -> C4)"""
-        note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-        octave = (note_number // 12) - 1
-        note = note_names[note_number % 12]
-        return f"{note}{octave} ({note_number})"
     
     def refresh_midi_devices(self):
         """Find and connect to first Nowde device"""
@@ -708,6 +740,28 @@ class MilluBridge:
         self.midi_refresh_thread = threading.Thread(target=self.auto_refresh_midi_devices, daemon=True)
         self.midi_refresh_thread.start()
     
+    def start_media_sync_thread(self):
+        """Start background thread to continuously send media sync packets"""
+        self.stop_media_sync = False
+        self.media_sync_thread = threading.Thread(target=self.continuous_media_sync, daemon=True)
+        self.media_sync_thread.start()
+    
+    def continuous_media_sync(self):
+        """Background thread to continuously send sync packets for all layers"""
+        while not self.stop_media_sync:
+            time.sleep(self.sync_settings['throttle_interval'])
+            
+            # Send sync for all tracked layers
+            if self.current_nowde_device and self.layers:
+                for layer_name, layer_data in self.layers.items():
+                    self.media_sync.update_layer(
+                        layer_name=layer_name,
+                        filename=layer_data["filename"],
+                        position=layer_data["position"],
+                        duration=layer_data["duration"],
+                        state=layer_data["state"]
+                    )
+    
     def auto_refresh_midi_devices(self):
         """Background thread to periodically check for Nowde devices"""
         last_ports = set()
@@ -759,6 +813,36 @@ class MilluBridge:
                 # Show note when not receiving OSC
                 dpg.show_item("osc_setup_note")
 
+    def on_throttle_changed(self, sender, app_data):
+        """Callback when throttle slider changes"""
+        hz = dpg.get_value("throttle_hz_slider")
+        interval = 1.0 / hz
+        self.sync_settings['throttle_interval'] = interval
+        self.media_sync.set_throttle_interval(interval)
+        self.update_osc_log(f"Throttle updated: {hz}Hz ({interval*1000:.1f}ms interval)")
+    
+    def on_sync_setting_changed(self, sender, app_data):
+        """Callback when sync settings are changed"""
+        # Update settings from GUI
+        if dpg.does_item_exist("mtc_framerate_input"):
+            self.sync_settings['mtc_framerate'] = max(1, dpg.get_value("mtc_framerate_input"))
+        if dpg.does_item_exist("freewheel_timeout_input"):
+            self.sync_settings['freewheel_timeout'] = max(0.1, dpg.get_value("freewheel_timeout_input"))
+        if dpg.does_item_exist("desync_threshold_input"):
+            self.sync_settings['clock_desync_threshold'] = max(10, dpg.get_value("desync_threshold_input"))
+        
+        # Send updated settings to Nowde via SysEx (if connected)
+        if self.current_nowde_device:
+            self.send_sync_settings_to_nowde()
+        
+        self.update_osc_log(f"Sync settings updated: {self.sync_settings}")
+    
+    def send_sync_settings_to_nowde(self):
+        """Send sync configuration to Nowde (for future SysEx command)"""
+        # Placeholder for future SysEx command to configure Nowde settings
+        # For now, these settings are only used in Bridge
+        pass
+    
     def on_osc_settings_changed(self, sender, app_data):
         """Callback when OSC settings are changed"""
         new_address = dpg.get_value("osc_address_input")
@@ -824,19 +908,10 @@ class MilluBridge:
     def on_quit(self):
         """Callback for Quit button"""
         self.stop_midi_refresh = True
+        self.stop_media_sync = True
         if self.is_running:
             self.stop_bridge()
         dpg.stop_dearpygui()
-
-    def map_osc_to_midi(self, message):
-        """
-        Placeholder for OSC-to-MIDI mapping logic
-        Parse OSC message and convert to MIDI format
-        Example: converts OSC message to MIDI Note On message
-        """
-        # Default MIDI message: Note On, Middle C, Velocity 100
-        # return [0x90, 60, 100]
-        return None  # No mapping by default
     
     def check_osc_status(self):
         """Background thread to check OSC status"""
@@ -863,6 +938,7 @@ class MilluBridge:
         
         # Cleanup
         self.stop_midi_refresh = True
+        self.stop_media_sync = True
         if self.is_running:
             self.stop_bridge()
         

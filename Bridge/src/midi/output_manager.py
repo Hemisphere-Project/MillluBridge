@@ -1,3 +1,19 @@
+# MilluBridge - MIDI Output Manager
+# Copyright (C) 2025 maigre - Hemisphere Project
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import rtmidi
 
 
@@ -13,6 +29,7 @@ class OutputManager:
         self.SYSEX_CMD_BRIDGE_CONNECTED = 0x01
         self.SYSEX_CMD_SUBSCRIBE_LAYER = 0x02
         self.SYSEX_CMD_CHANGE_RECEIVER_LAYER = 0x04
+        self.SYSEX_CMD_MEDIA_SYNC = 0x05
 
     def get_ports(self):
         """Get list of available MIDI output ports"""
@@ -94,6 +111,50 @@ class OutputManager:
         print(f"Sent Change Receiver Layer SysEx: MAC={mac_address}, Layer={layer_name}")
         return (True, self.format_sysex_message(message))
     
+    def send_media_sync(self, layer_name, media_index, position_ms, state):
+        """Send 'Media Sync' SysEx message with media index, position, and state
+        
+        Packet format (26 bytes total):
+        F0 7D 05 [layer_name(16 bytes)] [media_index(1)] [position_ms(4)] [state(1)] F7
+        
+        Args:
+            layer_name: Layer name (max 16 chars)
+            media_index: Media index 0-127 (0=stop, 1-127=media number)
+            position_ms: Position in milliseconds (uint32, 4 bytes)
+            state: 0=stopped, 1=playing
+        """
+        if not self.current_port:
+            return False
+        
+        # Pad or truncate layer name to exactly 16 bytes
+        layer_bytes = (layer_name[:16] + '\x00' * 16)[:16].encode('ascii')
+        
+        # Clamp media index to valid range
+        media_index = max(0, min(127, media_index))
+        
+        # Convert state to byte (0=stopped, 1=playing)
+        state_byte = 1 if state == 'playing' else 0
+        
+        # Convert position_ms to 4 bytes (big-endian uint32)
+        position_bytes = [
+            (position_ms >> 24) & 0xFF,
+            (position_ms >> 16) & 0xFF,
+            (position_ms >> 8) & 0xFF,
+            position_ms & 0xFF
+        ]
+        
+        message = ([self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
+                   self.SYSEX_CMD_MEDIA_SYNC] + 
+                   list(layer_bytes) + 
+                   [media_index] + 
+                   position_bytes + 
+                   [state_byte] + 
+                   [self.SYSEX_END])
+        
+        self.midi_out.send_message(message)
+        # Don't print every sync message to avoid spam
+        return (True, self.format_sysex_message(message))
+    
     def format_sysex_message(self, message):
         """Format SysEx message for human-readable logging"""
         if not message or message[0] != self.SYSEX_START:
@@ -128,6 +189,22 @@ class OutputManager:
             else:
                 hex_str = ' '.join(f'{b:02X}' for b in message)
                 return f"SysEx: Change Receiver Layer (malformed) ({hex_str})"
+        
+        elif cmd == self.SYSEX_CMD_MEDIA_SYNC:
+            # Extract layer, index, position, state
+            # Format: F0 7D 05 [Layer(16)] [Index(1)] [Position(4)] [State(1)] F7
+            if len(message) >= 26:  # F0 7D 05 + 16 Layer + 1 Index + 4 Position + 1 State + F7
+                layer_bytes = message[3:19]
+                layer_name = bytes(layer_bytes).decode('ascii', errors='ignore').rstrip('\x00')
+                media_index = message[19]
+                position_ms = (message[20] << 24) | (message[21] << 16) | (message[22] << 8) | message[23]
+                state_byte = message[24]
+                state_str = "playing" if state_byte == 1 else "stopped"
+                position_s = position_ms / 1000.0
+                return f"SysEx: Media Sync Layer='{layer_name}', Index={media_index}, Pos={position_s:.2f}s, State={state_str}"
+            else:
+                hex_str = ' '.join(f'{b:02X}' for b in message)
+                return f"SysEx: Media Sync (malformed) ({hex_str})"
         
         else:
             hex_str = ' '.join(f'{b:02X}' for b in message)

@@ -1,0 +1,67 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Run Bridge Application",
+            "type": "shell",
+            "command": "${workspaceFolder}/Bridge/.venv/bin/python",
+            "args": [
+                "src/main.py"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/Bridge"
+            },
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "Install Bridge Requirements",
+            "type": "shell",
+            "command": "${workspaceFolder}/Bridge/.venv/bin/pip",
+            "args": [
+                "install",
+                "-r",
+                "requirements.txt"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/Bridge"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Upload Nowde Firmware",
+            "type": "shell",
+            "command": "pio",
+            "args": [
+                "run",
+                "--target",
+                "upload"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/Nowde"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Monitor Nowde Serial",
+            "type": "shell",
+            "command": "pio",
+            "args": [
+                "device",
+                "monitor"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/Nowde"
+            },
+            "problemMatcher": [],
+            "isBackground": true
+        }
+    ]
+}
