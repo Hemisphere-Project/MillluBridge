@@ -1,0 +1,15 @@
+{
+  "sender_config": {
+    "rf_simulation_enabled": false,
+    "rf_simulation_max_delay_ms": 187
+  },
+  "gui_preferences": {
+    "window_position": [
+      100,
+      100
+    ],
+    "osc_address": "127.0.0.1",
+    "osc_port": 8000,
+    "media_sync_throttle_hz": 10
+  }
+}

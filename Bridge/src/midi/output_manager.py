@@ -26,17 +26,32 @@ class OutputManager:
         self.SYSEX_START = 0xF0
         self.SYSEX_END = 0xF7
         self.SYSEX_MANUFACTURER_ID = 0x7D
-        self.SYSEX_CMD_BRIDGE_CONNECTED = 0x01
-        self.SYSEX_CMD_SUBSCRIBE_LAYER = 0x02
-        self.SYSEX_CMD_CHANGE_RECEIVER_LAYER = 0x04
-        self.SYSEX_CMD_MEDIA_SYNC = 0x05
+        
+        # Bridge → Nowde Direct (0x01-0x0F)
+        self.SYSEX_CMD_QUERY_CONFIG = 0x01
+        self.SYSEX_CMD_PUSH_FULL_CONFIG = 0x02
+        self.SYSEX_CMD_QUERY_RUNNING_STATE = 0x03
+        
+        # Bridge → Receivers via Sender (0x10-0x1F)
+        self.SYSEX_CMD_MEDIA_SYNC = 0x10
+        self.SYSEX_CMD_CHANGE_RECEIVER_LAYER = 0x11
+        
+        # Nowde → Bridge Responses (0x20-0x3F)
+        self.SYSEX_CMD_CONFIG_STATE = 0x20
+        self.SYSEX_CMD_RUNNING_STATE = 0x21
+        self.SYSEX_CMD_ERROR_REPORT = 0x30
 
     def get_ports(self):
         """Get list of available MIDI output ports"""
-        ports = self.midi_out.get_ports()
-        if not ports:
-            return ["No MIDI ports available"]
-        return ports
+        try:
+            ports = self.midi_out.get_ports()
+            if not ports:
+                return ["No MIDI ports available"]
+            return ports
+        except Exception as e:
+            # Port list changed during enumeration (device unplugged)
+            print(f"Warning: Error enumerating MIDI output ports: {e}")
+            return []
 
     def open_port(self, port_name):
         """Open a MIDI output port by name"""
@@ -56,30 +71,50 @@ class OutputManager:
             self.current_port = None
             print("Closed MIDI port")
     
-    def send_bridge_connected(self):
-        """Send 'Bridge Connected' SysEx message to activate sender mode"""
+    def send_query_config(self):
+        """Send QUERY_CONFIG to request current config and activate sender mode"""
         if not self.current_port:
             return False
         
         # F0 7D 01 F7
         message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
-                   self.SYSEX_CMD_BRIDGE_CONNECTED, self.SYSEX_END]
+                   self.SYSEX_CMD_QUERY_CONFIG, self.SYSEX_END]
         self.midi_out.send_message(message)
-        print("Sent Bridge Connected SysEx")
+        print("Sent QUERY_CONFIG SysEx")
         return (True, self.format_sysex_message(message))
     
-    def send_subscribe_layer(self, layer_name):
-        """Send 'Subscribe to Layer' SysEx message to activate receiver mode"""
+    def send_push_full_config(self, rf_sim_enabled, rf_sim_max_delay_ms):
+        """Send PUSH_FULL_CONFIG to apply configuration to sender
+        
+        Args:
+            rf_sim_enabled: Boolean - enable RF simulation
+            rf_sim_max_delay_ms: Int - maximum delay in milliseconds (0-16383)
+        """
         if not self.current_port:
             return False
         
-        # F0 7D 02 [layer_name...] F7
-        # Limit layer name to 16 characters
-        layer_bytes = layer_name[:16].encode('ascii')
+        # F0 7D 02 [rfSimEnabled(1)] [rfSimMaxDelayHi(7-bit)] [rfSimMaxDelayLo(7-bit)] F7
+        # Use 7-bit encoding for MIDI SysEx compatibility (14-bit range = 0-16383)
+        enabled_byte = 1 if rf_sim_enabled else 0
+        delay_hi = (rf_sim_max_delay_ms >> 7) & 0x7F  # Upper 7 bits
+        delay_lo = rf_sim_max_delay_ms & 0x7F          # Lower 7 bits
+        
         message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
-                   self.SYSEX_CMD_SUBSCRIBE_LAYER] + list(layer_bytes) + [self.SYSEX_END]
+                   self.SYSEX_CMD_PUSH_FULL_CONFIG, enabled_byte, delay_hi, delay_lo, self.SYSEX_END]
         self.midi_out.send_message(message)
-        print(f"Sent Subscribe Layer SysEx: {layer_name}")
+        print(f"Sent PUSH_FULL_CONFIG: RF Sim={'ON' if rf_sim_enabled else 'OFF'}, MaxDelay={rf_sim_max_delay_ms}ms")
+        return (True, self.format_sysex_message(message))
+    
+    def send_query_running_state(self):
+        """Send QUERY_RUNNING_STATE to request runtime state and receiver table"""
+        if not self.current_port:
+            return False
+        
+        # F0 7D 03 F7
+        message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
+                   self.SYSEX_CMD_QUERY_RUNNING_STATE, self.SYSEX_END]
+        self.midi_out.send_message(message)
+        # print("Sent QUERY_RUNNING_STATE SysEx")
         return (True, self.format_sysex_message(message))
     
     def send_change_receiver_layer(self, mac_address, layer_name):
@@ -166,15 +201,20 @@ class OutputManager:
         
         cmd = message[2]
         
-        if cmd == self.SYSEX_CMD_BRIDGE_CONNECTED:
-            return "SysEx: Bridge Connected (F0 7D 01 F7)"
+        if cmd == self.SYSEX_CMD_QUERY_CONFIG:
+            return "SysEx: QUERY_CONFIG (F0 7D 01 F7)"
         
-        elif cmd == self.SYSEX_CMD_SUBSCRIBE_LAYER:
-            # Extract layer name
-            layer_bytes = message[3:-1]  # Skip F0, 7D, CMD at start and F7 at end
-            layer_name = bytes(layer_bytes).decode('ascii', errors='ignore').rstrip('\x00')
-            hex_str = ' '.join(f'{b:02X}' for b in message)
-            return f"SysEx: Subscribe to Layer '{layer_name}' ({hex_str})"
+        elif cmd == self.SYSEX_CMD_PUSH_FULL_CONFIG:
+            if len(message) >= 7:
+                rf_sim = "ON" if message[3] != 0 else "OFF"
+                max_delay = (message[4] << 8) | message[5]
+                return f"SysEx: PUSH_FULL_CONFIG RF={rf_sim}, MaxDelay={max_delay}ms"
+            else:
+                hex_str = ' '.join(f'{b:02X}' for b in message)
+                return f"SysEx: PUSH_FULL_CONFIG (malformed) ({hex_str})"
+        
+        elif cmd == self.SYSEX_CMD_QUERY_RUNNING_STATE:
+            return "SysEx: QUERY_RUNNING_STATE (F0 7D 03 F7)"
         
         elif cmd == self.SYSEX_CMD_CHANGE_RECEIVER_LAYER:
             # Extract MAC and layer name

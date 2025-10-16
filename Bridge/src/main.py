@@ -21,6 +21,8 @@ from midi.input_manager import InputManager
 import time
 import threading
 import re
+import json
+import os
 
 class MediaSyncManager:
     """Manages media synchronization state and throttling for each layer"""
@@ -94,9 +96,14 @@ class MediaSyncManager:
         self.throttle_interval = max(0.01, interval)  # Minimum 10ms
 
 class MilluBridge:
-    def __init__(self, osc_address="127.0.0.1", osc_port=8000):
-        self.osc_address = osc_address
-        self.osc_port = osc_port
+    def __init__(self, osc_address=None, osc_port=None):
+        # Load config first
+        self.config_file = "config.json"
+        self.config = self.load_config()
+        
+        # Use provided values or fall back to config
+        self.osc_address = osc_address or self.config['gui_preferences']['osc_address']
+        self.osc_port = osc_port or self.config['gui_preferences']['osc_port']
         self.osc_server = None
         self.output_manager = OutputManager()
         self.input_manager = InputManager(
@@ -108,9 +115,12 @@ class MilluBridge:
         self.status_check_thread = None
         self.midi_refresh_thread = None
         self.media_sync_thread = None
+        self.running_state_thread = None
         self.stop_midi_refresh = False
         self.stop_media_sync = False
+        self.stop_running_state = False
         self.current_nowde_device = None
+        self.sender_initialized = False  # Set to True after receiving HELLO
         
         # Millumin layer tracking
         self.layers = {}  # {layer_name: {state, filename, position, duration}}
@@ -147,8 +157,82 @@ class MilluBridge:
         # Start media sync thread for continuous updates
         self.start_media_sync_thread()
         
+        # Start running state query thread
+        self.start_running_state_thread()
+        
         # Auto-start bridge
         self.start_bridge()
+
+    def load_config(self):
+        """Load configuration from config.json, forcing RF sim to disabled"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                
+                # Force RF simulation OFF on load (safety measure)
+                if 'sender_config' in config:
+                    config['sender_config']['rf_simulation_enabled'] = False
+                
+                # Apply defaults for missing keys
+                if 'gui_preferences' not in config:
+                    config['gui_preferences'] = {}
+                
+                config['gui_preferences'].setdefault('osc_address', '127.0.0.1')
+                config['gui_preferences'].setdefault('osc_port', 8000)
+                config['gui_preferences'].setdefault('media_sync_throttle_hz', 10)
+                config['gui_preferences'].setdefault('window_position', [100, 100])
+                
+                if 'sender_config' not in config:
+                    config['sender_config'] = {}
+                
+                config['sender_config'].setdefault('rf_simulation_enabled', False)
+                config['sender_config'].setdefault('rf_simulation_max_delay_ms', 400)
+                
+                print(f"Config loaded from {self.config_file}")
+                return config
+            else:
+                print(f"No config file found, using defaults")
+                return self.get_default_config()
+                
+        except Exception as e:
+            print(f"Error loading config: {e}, using defaults")
+            return self.get_default_config()
+    
+    def get_default_config(self):
+        """Return default configuration"""
+        return {
+            "sender_config": {
+                "rf_simulation_enabled": False,
+                "rf_simulation_max_delay_ms": 400
+            },
+            "gui_preferences": {
+                "window_position": [100, 100],
+                "osc_address": "127.0.0.1",
+                "osc_port": 8000,
+                "media_sync_throttle_hz": 10
+            }
+        }
+    
+    def save_config(self):
+        """Save current configuration to config.json"""
+        try:
+            # Update config from current state
+            self.config['gui_preferences']['osc_address'] = self.osc_address
+            self.config['gui_preferences']['osc_port'] = self.osc_port
+            
+            # Calculate throttle Hz from interval
+            if self.sync_settings['throttle_interval'] > 0:
+                self.config['gui_preferences']['media_sync_throttle_hz'] = int(1.0 / self.sync_settings['throttle_interval'])
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=2)
+            
+            print(f"Config saved to {self.config_file}")
+            return True
+        except Exception as e:
+            print(f"Error saving config: {e}")
+            return False
 
     def setup_gui(self):
         """Setup the DearPyGUI interface"""
@@ -245,6 +329,18 @@ class MilluBridge:
                 dpg.add_text("Not connected", tag="nowde_status_text", color=(150, 150, 150))
                 dpg.add_button(label="Show Logs", tag="nowde_logs_toggle_btn", callback=self.toggle_nowde_logs, width=100)
             
+            # RF Simulation control
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="Simulate Bad RF", tag="rf_sim_checkbox",
+                               default_value=self.config['sender_config']['rf_simulation_enabled'],
+                               callback=self.on_rf_sim_changed)
+                dpg.add_text("Max Delay:")
+                dpg.add_slider_int(tag="rf_sim_max_delay_slider",
+                                 default_value=self.config['sender_config']['rf_simulation_max_delay_ms'],
+                                 min_value=1, max_value=1000, width=150,
+                                 callback=self.on_rf_sim_max_delay_changed)
+                dpg.add_text("ms")
+            
             # Nowde Logs section (hidden by default)
             with dpg.group(tag="nowde_logs_section", show=False):
                 dpg.add_separator()
@@ -265,21 +361,92 @@ class MilluBridge:
                           row_background=True, resizable=True, height=150):
                 dpg.add_table_column(label="Nowde", width_fixed=True, init_width_or_weight=100)
                 dpg.add_table_column(label="Version", width_fixed=True, init_width_or_weight=80)
+                dpg.add_table_column(label="Last Seen", width_fixed=True, init_width_or_weight=100)
                 dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=80)
                 dpg.add_table_column(label="Layer", width_stretch=True)
 
     def handle_sysex_message(self, msg_type, data):
         """Handle parsed SysEx messages from Nowde"""
-        if msg_type == 'receiver_table':
-            # Update remote Nowdes table
-            for nowde in data:
-                self.remote_nowdes[nowde['mac']] = nowde
+        if msg_type == 'hello':
+            # Sender just booted/rebooted - reinitialize connection
+            version = data['version']
+            uptime_ms = data['uptime_ms']
+            boot_reason = data['boot_reason_str']
+            
+            was_initialized = self.sender_initialized
+            
+            if not was_initialized:
+                self.update_osc_log(f"Nowde HELLO received: v{version}, uptime {uptime_ms}ms, reason: {boot_reason}")
+            else:
+                self.update_osc_log(f"Nowde REBOOT detected: v{version}, uptime {uptime_ms}ms, reason: {boot_reason}")
+            
+            self.log_nowde_message(f"HELLO: v{version}, Boot reason: {boot_reason}")
+            
+            # Mark sender as initialized
+            self.sender_initialized = True
+            
+            # Clear stale state
+            self.remote_nowdes.clear()
+            self.update_remote_nowdes_table()
+            
+            # Push our config to sender (don't query again - we already did that)
+            if self.current_nowde_device and self.output_manager.current_port:
+                # Push saved config to sender
+                rf_sim_enabled = self.config['sender_config']['rf_simulation_enabled']
+                rf_sim_max_delay = self.config['sender_config']['rf_simulation_max_delay_ms']
+                
+                result = self.output_manager.send_push_full_config(rf_sim_enabled, rf_sim_max_delay)
+                if result and result[0]:
+                    success, formatted_msg = result
+                    self.log_nowde_message(f"TX: {formatted_msg}")
+                    self.update_osc_log("Sender initialized - config pushed")
+                
+                # Query running state to get receiver table
+                time.sleep(0.1)
+                result = self.output_manager.send_query_running_state()
+                if result and result[0]:
+                    success, formatted_msg = result
+                    self.log_nowde_message(f"TX: {formatted_msg}")
+        
+        elif msg_type == 'config_state':
+            # Update config from sender's response
+            self.config['sender_config']['rf_simulation_enabled'] = data['rf_simulation_enabled']
+            self.config['sender_config']['rf_simulation_max_delay_ms'] = data['rf_simulation_max_delay_ms']
+            
+            # Update GUI if RF sim checkbox exists
+            if dpg.does_item_exist("rf_sim_checkbox"):
+                dpg.set_value("rf_sim_checkbox", data['rf_simulation_enabled'])
+            
+            # Log
+            self.update_osc_log(f"Config received from sender: RF Sim={'ON' if data['rf_simulation_enabled'] else 'OFF'}")
+        
+        elif msg_type == 'running_state':
+            # Incrementally update remote Nowdes table from receiver list
+            # Don't clear the dict - just update/add entries
+            received_macs = set()
+            for receiver in data['receivers']:
+                self.remote_nowdes[receiver['mac']] = receiver
+                received_macs.add(receiver['mac'])
+            
+            # Remove receivers that are no longer in the list
+            macs_to_remove = set(self.remote_nowdes.keys()) - received_macs
+            for mac in macs_to_remove:
+                del self.remote_nowdes[mac]
             
             # Update GUI
             self.update_remote_nowdes_table()
             
-            # Log to OSC log
-            self.update_osc_log(f"Remote Nowdes updated: {len(data)} device(s)")
+            # Log
+            mesh_status = "SYNCED" if data['mesh_synced'] else "NOT SYNCED"
+            self.update_osc_log(f"Running state: Uptime {data['uptime_s']:.1f}s, Mesh {mesh_status}, {len(data['receivers'])} receiver(s)")
+        
+        elif msg_type == 'error_report':
+            # Log error from Nowde
+            error_msg = f"Nowde Error: {data['error_name']} (0x{data['error_code']:02X})"
+            if data['context_bytes']:
+                error_msg += f" Context: {' '.join(f'{b:02X}' for b in data['context_bytes'])}"
+            self.update_osc_log(error_msg)
+            self.log_nowde_message(f"ERROR: {error_msg}")
         
         elif msg_type == 'sysex_received':
             # Log received SysEx in human-readable format
@@ -396,18 +563,31 @@ class MilluBridge:
         if not dpg.does_item_exist("remote_nowdes_table"):
             return
         
-        # Clear existing rows (except header)
+        # Track which rows we've seen (to remove stale ones)
+        seen_macs = set(self.remote_nowdes.keys())
+        existing_rows = set()
+        
+        # Get existing rows
         children = dpg.get_item_children("remote_nowdes_table", slot=1)
         if children:
             for child in children:
-                dpg.delete_item(child)
+                # Extract MAC from row tag (format: "nowde_row_AA:BB:CC:DD:EE:FF")
+                tag = dpg.get_item_alias(child)
+                if tag and tag.startswith("nowde_row_"):
+                    mac = tag[10:]  # Remove "nowde_row_" prefix
+                    if mac not in seen_macs:
+                        # Remove stale row
+                        dpg.delete_item(child)
+                    else:
+                        existing_rows.add(mac)
         
-        # Add rows for each remote Nowde, sorted by UUID
+        # Update or add rows for each remote Nowde, sorted by UUID
         for mac, nowde in sorted(self.remote_nowdes.items(), key=lambda x: x[1].get('uuid', '')):
-            # Determine colors based on connection status
-            connected = nowde.get('connected', True)
+            # Determine colors based on active status
+            active = nowde.get('active', True)
+            last_seen_ms = nowde.get('last_seen_ms', 0)
             
-            if connected:
+            if active and last_seen_ms < 5000:  # Active if seen in last 5 seconds
                 # Active: normal colors
                 state_text = "ACTIVE"
                 state_color = (0, 255, 0)  # Green
@@ -422,20 +602,43 @@ class MilluBridge:
                 version_color = (150, 80, 80)
                 layer_color = (150, 80, 80)
             
-            with dpg.table_row(parent="remote_nowdes_table"):
-                dpg.add_text(nowde['uuid'], color=uuid_color)
-                dpg.add_text(nowde['version'], color=version_color)
-                dpg.add_text(state_text, color=state_color)
-                
-                # Clickable button to edit layer
-                layer_btn_tag = f"layer_btn_{mac}"
-                dpg.add_button(
-                    tag=layer_btn_tag,
-                    label=nowde['layer'],
-                    width=150,  # Limit width to ~16 chars
-                    callback=lambda s, a, u: self.open_layer_editor(u['mac']),
-                    user_data={'mac': mac}
-                )
+            row_tag = f"nowde_row_{mac}"
+            uuid_tag = f"nowde_uuid_{mac}"
+            version_tag = f"nowde_version_{mac}"
+            lastseen_tag = f"nowde_lastseen_{mac}"
+            state_tag = f"nowde_state_{mac}"
+            layer_btn_tag = f"layer_btn_{mac}"
+            
+            if mac in existing_rows:
+                # Update existing row
+                if dpg.does_item_exist(uuid_tag):
+                    dpg.set_value(uuid_tag, nowde['uuid'])
+                    dpg.configure_item(uuid_tag, color=uuid_color)
+                if dpg.does_item_exist(version_tag):
+                    dpg.set_value(version_tag, nowde.get('version', '?'))
+                    dpg.configure_item(version_tag, color=version_color)
+                if dpg.does_item_exist(lastseen_tag):
+                    dpg.set_value(lastseen_tag, f"{last_seen_ms}ms ago")
+                    dpg.configure_item(lastseen_tag, color=uuid_color)
+                if dpg.does_item_exist(state_tag):
+                    dpg.set_value(state_tag, state_text)
+                    dpg.configure_item(state_tag, color=state_color)
+                if dpg.does_item_exist(layer_btn_tag):
+                    dpg.configure_item(layer_btn_tag, label=nowde.get('layer', '-'))
+            else:
+                # Create new row
+                with dpg.table_row(parent="remote_nowdes_table", tag=row_tag):
+                    dpg.add_text(nowde['uuid'], tag=uuid_tag, color=uuid_color)
+                    dpg.add_text(nowde.get('version', '?'), tag=version_tag, color=version_color)
+                    dpg.add_text(f"{last_seen_ms}ms ago", tag=lastseen_tag, color=uuid_color)
+                    dpg.add_text(state_text, tag=state_tag, color=state_color)
+                    dpg.add_button(
+                        tag=layer_btn_tag,
+                        label=nowde.get('layer', '-'),
+                        width=150,
+                        callback=lambda s, a, u: self.open_layer_editor(u['mac']),
+                        user_data={'mac': mac}
+                    )
     
     def handle_osc_message(self, message):
         self.last_osc_time = time.time()
@@ -660,25 +863,42 @@ class MilluBridge:
                 dpg.set_y_scroll("midi_log_window", dpg.get_y_scroll_max("midi_log_window"))
     
     def refresh_midi_devices(self):
-        """Find and connect to first Nowde device"""
+        """Find and connect to first Nowde device (single-device mode)"""
         # Get all available ports (union of input and output)
-        out_ports = set(self.output_manager.get_ports())
-        in_ports = set(self.input_manager.get_ports())
-        all_ports = sorted(list(out_ports | in_ports))
+        try:
+            out_ports = set(self.output_manager.get_ports())
+            in_ports = set(self.input_manager.get_ports())
+            all_ports = sorted(list(out_ports | in_ports))
+        except Exception as e:
+            print(f"Error getting MIDI ports: {e}")
+            # If we can't enumerate ports and had a device, assume disconnection
+            if self.current_nowde_device:
+                self.disconnect_nowde_device()
+            return
         
+        # Check if currently connected device is still available
+        if self.current_nowde_device:
+            device_still_present = self.current_nowde_device in all_ports
+            
+            if device_still_present:
+                # Current device still present and working, keep connection
+                return
+            else:
+                # Current device disconnected
+                self.disconnect_nowde_device()
+        
+        # Only try to connect if we don't have a device
         # Find first device starting with "Nowde"
-        nowde_device = None
-        for port in all_ports:
-            if port.startswith("Nowde"):
-                nowde_device = port
-                break
-        
-        # If we found a Nowde device and it's different from current, connect to it
-        if nowde_device and nowde_device != self.current_nowde_device:
-            self.connect_nowde_device(nowde_device)
-        elif not nowde_device and self.current_nowde_device:
-            # Nowde was disconnected
-            self.disconnect_nowde_device()
+        if not self.current_nowde_device:
+            nowde_device = None
+            for port in all_ports:
+                if port.startswith("Nowde"):
+                    nowde_device = port
+                    break
+            
+            # Connect to the first Nowde found
+            if nowde_device:
+                self.connect_nowde_device(nowde_device)
     
     def connect_nowde_device(self, device_name):
         """Connect to a Nowde device"""
@@ -697,12 +917,15 @@ class MilluBridge:
             self.update_nowde_status(True, device_name)
             self.update_osc_log(f"Nowde connected: {device_name}")
             
-            # Send Bridge Connected SysEx to activate sender mode
+            # Send QUERY_CONFIG to trigger sender to send HELLO + CONFIG_STATE
+            # This handles both fresh boot and reconnection scenarios
             if out_success:
-                result = self.output_manager.send_bridge_connected()
+                time.sleep(0.1)  # Small delay for port to stabilize
+                result = self.output_manager.send_query_config()
                 if result and result[0]:
                     success, formatted_msg = result
                     self.log_nowde_message(f"TX: {formatted_msg}")
+                    self.update_osc_log("Sent QUERY_CONFIG, waiting for HELLO response...")
         else:
             self.update_osc_log(f"Failed to connect to: {device_name}")
     
@@ -714,6 +937,12 @@ class MilluBridge:
             self.update_osc_log(f"Nowde disconnected: {self.current_nowde_device}")
             self.current_nowde_device = None
             self.selected_port = None
+            self.sender_initialized = False  # Reset initialization flag
+            
+            # Clear remote nowdes table
+            self.remote_nowdes.clear()
+            self.update_remote_nowdes_table()
+            
             self.update_nowde_status(False, None)
     
     def update_nowde_status(self, connected, device_name=None):
@@ -762,6 +991,25 @@ class MilluBridge:
                         state=layer_data["state"]
                     )
     
+    def start_running_state_thread(self):
+        """Start background thread to query running state every second"""
+        self.stop_running_state = False
+        
+        def running_state_loop():
+            while not self.stop_running_state:
+                try:
+                    # Query running state only if sender is initialized (received HELLO)
+                    if self.current_nowde_device and self.output_manager.current_port and self.sender_initialized:
+                        self.output_manager.send_query_running_state()
+                    time.sleep(1.0)  # 1Hz query rate
+                except Exception as e:
+                    print(f"Error in running state thread: {e}")
+                    time.sleep(1)
+        
+        self.running_state_thread = threading.Thread(target=running_state_loop, daemon=True)
+        self.running_state_thread.start()
+        print("Running state query thread started")
+    
     def auto_refresh_midi_devices(self):
         """Background thread to periodically check for Nowde devices"""
         last_ports = set()
@@ -769,15 +1017,20 @@ class MilluBridge:
         while not self.stop_midi_refresh:
             time.sleep(2)  # Check every 2 seconds
             
-            # Get all available ports (union of input and output)
-            out_ports = set(self.output_manager.get_ports())
-            in_ports = set(self.input_manager.get_ports())
-            current_ports = out_ports | in_ports
-            
-            # Only update if ports changed
-            if current_ports != last_ports:
-                self.refresh_midi_devices()
-                last_ports = current_ports
+            try:
+                # Get all available ports (union of input and output)
+                out_ports = set(self.output_manager.get_ports())
+                in_ports = set(self.input_manager.get_ports())
+                current_ports = out_ports | in_ports
+                
+                # Only update if ports changed
+                if current_ports != last_ports:
+                    self.refresh_midi_devices()
+                    last_ports = current_ports
+            except Exception as e:
+                # Handle errors during port enumeration (e.g., device unplugged mid-query)
+                print(f"Warning: Error in MIDI device refresh: {e}")
+                time.sleep(0.5)  # Short delay before retry
 
     def update_osc_status(self, active):
         """Update the OSC status indicator"""
@@ -843,6 +1096,54 @@ class MilluBridge:
         # For now, these settings are only used in Bridge
         pass
     
+    def on_rf_sim_changed(self, sender, app_data):
+        """Callback when RF simulation checkbox is toggled"""
+        rf_sim_enabled = dpg.get_value("rf_sim_checkbox")
+        
+        # Update config
+        self.config['sender_config']['rf_simulation_enabled'] = rf_sim_enabled
+        
+        # Send to Nowde if connected
+        if self.current_nowde_device:
+            rf_sim_max_delay = self.config['sender_config']['rf_simulation_max_delay_ms']
+            result = self.output_manager.send_push_full_config(rf_sim_enabled, rf_sim_max_delay)
+            if result and result[0]:
+                success, formatted_msg = result
+                self.log_nowde_message(f"TX: {formatted_msg}")
+                self.update_osc_log(f"RF Simulation: {'ENABLED' if rf_sim_enabled else 'DISABLED'}")
+            else:
+                self.update_osc_log("Error: Failed to send RF simulation config")
+                # Revert checkbox on failure
+                dpg.set_value("rf_sim_checkbox", not rf_sim_enabled)
+        else:
+            self.update_osc_log("Warning: No Nowde connected, RF simulation setting saved for next connection")
+        
+        # Save config to file
+        self.save_config()
+    
+    def on_rf_sim_max_delay_changed(self, sender, app_data):
+        """Callback when RF simulation max delay slider changes"""
+        rf_sim_max_delay = dpg.get_value("rf_sim_max_delay_slider")
+        
+        # Update config
+        self.config['sender_config']['rf_simulation_max_delay_ms'] = rf_sim_max_delay
+        
+        # Send to Nowde if connected and RF sim is enabled
+        if self.current_nowde_device:
+            rf_sim_enabled = self.config['sender_config']['rf_simulation_enabled']
+            result = self.output_manager.send_push_full_config(rf_sim_enabled, rf_sim_max_delay)
+            if result and result[0]:
+                success, formatted_msg = result
+                self.log_nowde_message(f"TX: {formatted_msg}")
+                self.update_osc_log(f"RF Simulation Max Delay: {rf_sim_max_delay}ms")
+            else:
+                self.update_osc_log("Error: Failed to send RF simulation config")
+        else:
+            self.update_osc_log("Warning: No Nowde connected, RF simulation setting saved for next connection")
+        
+        # Save config to file
+        self.save_config()
+    
     def on_osc_settings_changed(self, sender, app_data):
         """Callback when OSC settings are changed"""
         new_address = dpg.get_value("osc_address_input")
@@ -857,6 +1158,8 @@ class MilluBridge:
             self.osc_address = new_address
             self.osc_port = new_port
             self.update_osc_log(f"OSC settings changed to {self.osc_address}:{self.osc_port}")
+            # Save config
+            self.save_config()
             # Restart the bridge with new settings
             self.restart_bridge()
     
@@ -939,6 +1242,7 @@ class MilluBridge:
         # Cleanup
         self.stop_midi_refresh = True
         self.stop_media_sync = True
+        self.stop_running_state = True
         if self.is_running:
             self.stop_bridge()
         

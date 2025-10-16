@@ -476,3 +476,93 @@ Possible improvements:
 - Bi-directional sync feedback
 - Cloud-based configuration
 - Web-based Bridge interface
+
+---
+
+## Reconnection & Hot-Plug Protocol
+
+### HELLO Handshake
+
+The system implements a robust HELLO handshake protocol to handle all connection scenarios:
+
+**Message Format** (0x20):
+```
+F0 7D 20 [version(8,encoded)] [uptimeMs(4,encoded)] [bootReason(1)] F7
+```
+
+**Triggers**:
+1. Sender boot (after 500ms delay for USB enumeration)
+2. Sender receives QUERY_CONFIG from Bridge
+
+**Bridge Response**:
+1. Sets `sender_initialized = True`
+2. Clears stale remote_nowdes table
+3. Pushes configuration (RF sim settings)
+4. Queries running state
+
+### Connection Scenarios
+
+**Scenario 1: Fresh Sender Boot (Bridge Running)**
+```
+1. Sender: Boot → delay 500ms → send HELLO
+2. Bridge: USB detect → connect → send QUERY_CONFIG
+3. Sender: Receive QUERY_CONFIG → send HELLO + CONFIG_STATE
+4. Bridge: Receive HELLO → initialize → push config → query state
+5. ✅ Fully synchronized
+```
+
+**Scenario 2: Bridge Restart (Sender Already Running)**
+```
+1. Bridge: Start → detect USB device → connect
+2. Bridge: Send QUERY_CONFIG
+3. Sender: Receive QUERY_CONFIG → send HELLO + CONFIG_STATE
+4. Bridge: Receive HELLO → initialize → push config → query state
+5. ✅ Fully synchronized
+```
+
+**Scenario 3: Sender Disconnect/Reconnect**
+```
+1. Bridge: Detect disconnect (USB enumeration change)
+2. Bridge: Clear sender_initialized flag and remote_nowdes
+3. Bridge: Detect reconnect → send QUERY_CONFIG
+4. Sender: Receive QUERY_CONFIG → send HELLO + CONFIG_STATE
+5. Bridge: Receive HELLO → initialize → push config → query state
+6. ✅ Fully synchronized
+```
+
+**Scenario 4: Sender Quick Reboot**
+```
+1. Sender: Reboot → delay 500ms → send HELLO
+2. Bridge: May/may not detect USB disconnect (timing dependent)
+3. Bridge: Receive HELLO → detect reboot (uptime low)
+4. Bridge: Reinitialize → push config → query state
+5. ✅ Fully synchronized
+```
+
+### State Management
+
+**Bridge State Flags**:
+- `sender_initialized`: Set to `True` only after receiving HELLO
+- `current_nowde_device`: Current USB device name (or `None`)
+- `remote_nowdes`: Dictionary of discovered receivers
+
+**Query Blocking**:
+- Running state queries (1Hz thread) only execute when `sender_initialized == True`
+- Prevents sending commands before sender is ready
+- Avoids race conditions during boot
+
+### 7-bit Encoding
+
+All multi-byte data in SysEx messages uses 7-bit encoding to prevent USB MIDI protocol corruption:
+
+**Encoding Process** (every 7 bytes → 8 bytes):
+1. Extract MSBs from 7 data bytes
+2. Pack MSBs into first output byte
+3. Output 7-bit data bytes (MSB cleared)
+
+**Example**: RUNNING_STATE message
+- Uptime: 4 bytes → 5 bytes encoded
+- Receiver entry: 35 bytes → 40 bytes encoded
+- Version string: 8 bytes → 10 bytes encoded
+
+This ensures no byte with bit 7 set (0x80-0xFF) ever appears as data in USB MIDI packets, preventing confusion with MIDI status bytes.
