@@ -244,8 +244,8 @@ class InputManager:
     
     def _parse_running_state(self, sysex_data):
         """Parse RUNNING_STATE SysEx message
-        Format: F0 7D 21 [uptime(4,encoded:5)] [meshSynced(1)] [numReceivers(1)] 
-                [receiver1_data(35,encoded:40)...] F7
+        Format: F0 7D 22 [uptime(4,encoded:5)] [meshSynced(1)] [numReceivers(1)] 
+                [receiver1_data(36,encoded:42)...] F7
         All multi-byte fields are 7-bit encoded
         """
         if len(sysex_data) < 11:  # Minimum: F0 7D 21 + 5 uptime(encoded) + 1 sync + 1 count + F7
@@ -277,16 +277,16 @@ class InputManager:
         
         receivers = []
         
-        # Parse each receiver (40 bytes encoded -> 35 bytes decoded)
+        # Parse each receiver (42 bytes encoded -> 36 bytes decoded)
         for i in range(num_receivers):
-            if idx + 40 > len(sysex_data) - 1:  # -1 for SYSEX_END
+            if idx + 42 > len(sysex_data) - 1:  # -1 for SYSEX_END
                 break
             
-            # Decode receiver data (40 bytes encoded -> 35 bytes decoded)
-            receiver_encoded = sysex_data[idx:idx+40]
+            # Decode receiver data (42 bytes encoded -> 36 bytes decoded)
+            receiver_encoded = sysex_data[idx:idx+42]
             receiver_decoded = self._decode_7bit(receiver_encoded)
             
-            if len(receiver_decoded) < 35:
+            if len(receiver_decoded) < 36:
                 break
             
             # MAC (6 bytes)
@@ -307,6 +307,9 @@ class InputManager:
             # Active (1 byte)
             active = receiver_decoded[34] != 0
             
+            # Media index (1 byte) - current playing media index (0 = stopped)
+            media_index = receiver_decoded[35]
+            
             # Generate UUID from last 3 bytes of MAC
             uuid = mac_str[-8:].replace(':', '')
             
@@ -317,10 +320,11 @@ class InputManager:
                 'version': version_str,
                 'last_seen_ms': last_seen_ms,
                 'active': active,
+                'media_index': media_index,
                 'name': f"Nowde-{uuid}"
             })
             
-            idx += 40
+            idx += 42
         
         running_state = {
             'uptime_ms': uptime_ms,

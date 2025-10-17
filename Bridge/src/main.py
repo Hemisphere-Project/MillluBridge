@@ -361,8 +361,8 @@ class MilluBridge:
                           row_background=True, resizable=True, height=150):
                 dpg.add_table_column(label="Nowde", width_fixed=True, init_width_or_weight=100)
                 dpg.add_table_column(label="Version", width_fixed=True, init_width_or_weight=80)
-                dpg.add_table_column(label="Last Seen", width_fixed=True, init_width_or_weight=100)
                 dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=80)
+                dpg.add_table_column(label="Index", width_fixed=True, init_width_or_weight=60)
                 dpg.add_table_column(label="Layer", width_stretch=True)
 
     def handle_sysex_message(self, msg_type, data):
@@ -563,7 +563,7 @@ class MilluBridge:
         if not dpg.does_item_exist("remote_nowdes_table"):
             return
         
-        # Track which rows we've seen (to remove stale ones)
+        # Track which rows we've seen (to remove stale ones after 15 min)
         seen_macs = set(self.remote_nowdes.keys())
         existing_rows = set()
         
@@ -576,62 +576,65 @@ class MilluBridge:
                 if tag and tag.startswith("nowde_row_"):
                     mac = tag[10:]  # Remove "nowde_row_" prefix
                     if mac not in seen_macs:
-                        # Remove stale row
-                        dpg.delete_item(child)
+                        # Remove stale row (only after 15 min)
+                        last_seen_ms = self.remote_nowdes.get(mac, {}).get('last_seen_ms', 0)
+                        if last_seen_ms > 900000:  # 15 minutes
+                            dpg.delete_item(child)
                     else:
                         existing_rows.add(mac)
         
         # Update or add rows for each remote Nowde, sorted by UUID
         for mac, nowde in sorted(self.remote_nowdes.items(), key=lambda x: x[1].get('uuid', '')):
-            # Determine colors based on active status
+            # Determine colors based on last seen time (3-state)
             active = nowde.get('active', True)
             last_seen_ms = nowde.get('last_seen_ms', 0)
+            media_index = nowde.get('media_index', 0)
             
-            if active and last_seen_ms < 5000:  # Active if seen in last 5 seconds
-                # Active: normal colors
+            if active and last_seen_ms < 3000:  # < 3s = ACTIVE
                 state_text = "ACTIVE"
                 state_color = (0, 255, 0)  # Green
-                uuid_color = (255, 255, 255)
-                version_color = (255, 255, 255)
-                layer_color = (255, 255, 255)
-            else:
-                # Missing: dark red colors
+                text_color = (255, 255, 255)
+            elif last_seen_ms < 30000:  # 3s-30s = MISSING
                 state_text = "MISSING"
-                state_color = (139, 0, 0)  # Dark red
-                uuid_color = (150, 80, 80)
-                version_color = (150, 80, 80)
-                layer_color = (150, 80, 80)
+                state_color = (255, 255, 0)  # Yellow
+                text_color = (200, 200, 150)
+            else:  # > 30s = GONE
+                state_text = "GONE"
+                state_color = (255, 0, 0)  # Red
+                text_color = (150, 80, 80)
             
             row_tag = f"nowde_row_{mac}"
             uuid_tag = f"nowde_uuid_{mac}"
             version_tag = f"nowde_version_{mac}"
-            lastseen_tag = f"nowde_lastseen_{mac}"
             state_tag = f"nowde_state_{mac}"
+            index_tag = f"nowde_index_{mac}"
             layer_btn_tag = f"layer_btn_{mac}"
             
             if mac in existing_rows:
                 # Update existing row
                 if dpg.does_item_exist(uuid_tag):
                     dpg.set_value(uuid_tag, nowde['uuid'])
-                    dpg.configure_item(uuid_tag, color=uuid_color)
+                    dpg.configure_item(uuid_tag, color=text_color)
                 if dpg.does_item_exist(version_tag):
                     dpg.set_value(version_tag, nowde.get('version', '?'))
-                    dpg.configure_item(version_tag, color=version_color)
-                if dpg.does_item_exist(lastseen_tag):
-                    dpg.set_value(lastseen_tag, f"{last_seen_ms}ms ago")
-                    dpg.configure_item(lastseen_tag, color=uuid_color)
+                    dpg.configure_item(version_tag, color=text_color)
                 if dpg.does_item_exist(state_tag):
                     dpg.set_value(state_tag, state_text)
                     dpg.configure_item(state_tag, color=state_color)
+                if dpg.does_item_exist(index_tag):
+                    index_str = str(media_index) if media_index > 0 else "-"
+                    dpg.set_value(index_tag, index_str)
+                    dpg.configure_item(index_tag, color=text_color)
                 if dpg.does_item_exist(layer_btn_tag):
                     dpg.configure_item(layer_btn_tag, label=nowde.get('layer', '-'))
             else:
                 # Create new row
                 with dpg.table_row(parent="remote_nowdes_table", tag=row_tag):
-                    dpg.add_text(nowde['uuid'], tag=uuid_tag, color=uuid_color)
-                    dpg.add_text(nowde.get('version', '?'), tag=version_tag, color=version_color)
-                    dpg.add_text(f"{last_seen_ms}ms ago", tag=lastseen_tag, color=uuid_color)
+                    dpg.add_text(nowde['uuid'], tag=uuid_tag, color=text_color)
+                    dpg.add_text(nowde.get('version', '?'), tag=version_tag, color=text_color)
                     dpg.add_text(state_text, tag=state_tag, color=state_color)
+                    index_str = str(media_index) if media_index > 0 else "-"
+                    dpg.add_text(index_str, tag=index_tag, color=text_color)
                     dpg.add_button(
                         tag=layer_btn_tag,
                         label=nowde.get('layer', '-'),
@@ -710,7 +713,10 @@ class MilluBridge:
             if route == "/media/time" and len(args) >= 2:
                 layer["position"] = float(args[0])
                 layer["duration"] = float(args[1])
-                layer["state"] = "playing"
+                # Only set state to playing if we have a filename (media has started)
+                # This prevents sending mediaIndex=0 when /media/time arrives before /mediaStarted
+                if layer["filename"]:
+                    layer["state"] = "playing"
             
             elif route == "/mediaStarted" and len(args) >= 2:
                 # mediaStarted format: (index, filename, duration)
@@ -721,21 +727,34 @@ class MilluBridge:
             
             elif route == "/mediaStopped" and len(args) >= 2:
                 # mediaStopped format: (index, filename, duration)
-                # Clear filename when stopped so media index will be 0
-                layer["filename"] = ""
-                layer["duration"] = 0.0
-                layer["position"] = 0.0  # Reset position to 0
-                layer["state"] = "stopped"
+                stopped_filename = str(args[1]) if len(args) > 1 else ""
+                
+                # Only apply stop if the stopped filename matches current playing filename
+                # This prevents old mediaStopped messages from stopping newly started media
+                # when switching media without explicit stop (Millumin behavior)
+                if layer["filename"] == stopped_filename or layer["filename"] == "":
+                    layer["filename"] = ""
+                    layer["duration"] = 0.0
+                    layer["position"] = 0.0
+                    layer["state"] = "stopped"
+                # else: ignore - a new media is already playing
             
-            # Send to media sync manager (always update, even for stopped state)
+            # Send to media sync manager (only if we have valid state)
+            # Skip sending if state=stopped and we have no filename (prevents spurious updates)
             if self.current_nowde_device:
-                self.media_sync.update_layer(
-                    layer_name=layer_name,
-                    filename=layer["filename"],
-                    position=layer["position"],
-                    duration=layer["duration"],
-                    state=layer["state"]
-                )
+                # Only send updates when:
+                # 1. Playing with a valid filename, OR
+                # 2. Stopped (to signal stop)
+                should_send = (layer["state"] == "playing" and layer["filename"]) or (layer["state"] == "stopped")
+                
+                if should_send:
+                    self.media_sync.update_layer(
+                        layer_name=layer_name,
+                        filename=layer["filename"],
+                        position=layer["position"],
+                        duration=layer["duration"],
+                        state=layer["state"]
+                    )
             
             # Update UI table
             self.update_layers_table()
