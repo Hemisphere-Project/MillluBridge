@@ -27,8 +27,9 @@ import os
 class MediaSyncManager:
     """Manages media synchronization state and throttling for each layer"""
     
-    def __init__(self, output_manager, throttle_interval=0.1):
+    def __init__(self, output_manager, bridge, throttle_interval=0.1):
         self.output_manager = output_manager
+        self.bridge = bridge
         self.throttle_interval = throttle_interval  # seconds (default 10Hz = 0.1s)
         self.layers_state = {}  # {layer_name: {index, position, state, last_sent_time, last_sent_index}}
     
@@ -79,12 +80,17 @@ class MediaSyncManager:
             should_send = True
         
         if should_send:
-            # Send media sync via SysEx 0x05
+            # Send media sync via SysEx 0x10
             position_ms = int(position * 1000)  # Convert to milliseconds
+            # Apply frame correction offset (convert frames to milliseconds based on FPS)
+            frame_correction_frames = self.bridge.sync_settings['frame_correction_frames']
+            fps = self.bridge.sync_settings['mtc_framerate']
+            frame_correction_ms = int((frame_correction_frames / fps) * 1000) if fps > 0 else 0
+            corrected_position_ms = max(0, position_ms + frame_correction_ms)
             self.output_manager.send_media_sync(
                 layer_name=layer_name,
                 media_index=media_index,
-                position_ms=position_ms,
+                position_ms=corrected_position_ms,
                 state=state
             )
             
@@ -138,11 +144,13 @@ class MilluBridge:
             'mtc_framerate': 30,  # fps
             'freewheel_timeout': 3.0,  # seconds
             'clock_desync_threshold': 200,  # milliseconds
-            'throttle_interval': 0.1  # seconds (10Hz)
+            'throttle_interval': 0.1,  # seconds (10Hz)
+            'frame_correction_frames': self.config['gui_preferences'].get('frame_correction_frames', 0)  # frames (global timestamp offset)
         }
         
         # Media sync manager
         self.media_sync = MediaSyncManager(self.output_manager, 
+                                          self,
                                           throttle_interval=self.sync_settings['throttle_interval'])
         
         # Create DearPyGUI context
@@ -181,6 +189,7 @@ class MilluBridge:
                 config['gui_preferences'].setdefault('osc_address', '127.0.0.1')
                 config['gui_preferences'].setdefault('osc_port', 8000)
                 config['gui_preferences'].setdefault('media_sync_throttle_hz', 10)
+                config['gui_preferences'].setdefault('frame_correction_frames', 0)
                 config['gui_preferences'].setdefault('window_position', [100, 100])
                 
                 if 'sender_config' not in config:
@@ -210,7 +219,8 @@ class MilluBridge:
                 "window_position": [100, 100],
                 "osc_address": "127.0.0.1",
                 "osc_port": 8000,
-                "media_sync_throttle_hz": 10
+                "media_sync_throttle_hz": 10,
+                "frame_correction_frames": 0
             }
         }
     
@@ -289,6 +299,14 @@ class MilluBridge:
                                  width=60, step=0, on_enter=True,
                                  callback=self.on_sync_setting_changed)
                 dpg.add_text("ms")
+            
+            with dpg.group(horizontal=True):
+                dpg.add_text("Frame Correction:")
+                dpg.add_input_int(tag="frame_correction_input",
+                                 default_value=self.sync_settings['frame_correction_frames'],
+                                 width=80, step=1, on_enter=True,
+                                 callback=self.on_sync_setting_changed)
+                dpg.add_text("frames (global timestamp offset)")
             
             # OSC Logs section (hidden by default)
             with dpg.group(tag="osc_logs_section", show=False):
@@ -1102,6 +1120,8 @@ class MilluBridge:
             self.sync_settings['freewheel_timeout'] = max(0.1, dpg.get_value("freewheel_timeout_input"))
         if dpg.does_item_exist("desync_threshold_input"):
             self.sync_settings['clock_desync_threshold'] = max(10, dpg.get_value("desync_threshold_input"))
+        if dpg.does_item_exist("frame_correction_input"):
+            self.sync_settings['frame_correction_frames'] = dpg.get_value("frame_correction_input")
         
         # Send updated settings to Nowde via SysEx (if connected)
         if self.current_nowde_device:

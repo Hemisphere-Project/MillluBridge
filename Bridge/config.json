@@ -10,6 +10,7 @@
     ],
     "osc_address": "127.0.0.1",
     "osc_port": 8000,
-    "media_sync_throttle_hz": 10
+    "media_sync_throttle_hz": 10,
+    "frame_correction_frames": 0
   }
 }

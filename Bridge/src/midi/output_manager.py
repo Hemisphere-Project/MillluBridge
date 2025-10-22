@@ -40,6 +40,48 @@ class OutputManager:
         self.SYSEX_CMD_CONFIG_STATE = 0x20
         self.SYSEX_CMD_RUNNING_STATE = 0x21
         self.SYSEX_CMD_ERROR_REPORT = 0x30
+    
+    def encode_7bit(self, data_bytes):
+        """Encode bytes to 7-bit MIDI-safe format.
+        Every 7 bytes becomes 8 bytes (MSBs packed in first byte).
+        
+        Args:
+            data_bytes: List of integers (0-255) to encode
+        Returns:
+            List of 7-bit safe bytes (0-127)
+        """
+        result = []
+        i = 0
+        while i < len(data_bytes):
+            # Pack MSBs of next 7 bytes into first output byte
+            chunk_size = min(7, len(data_bytes) - i)
+            msb_byte = 0
+            for j in range(chunk_size):
+                if data_bytes[i + j] & 0x80:
+                    msb_byte |= (1 << j)
+            result.append(msb_byte)
+            
+            # Add 7-bit data (clear MSB)
+            for j in range(chunk_size):
+                result.append(data_bytes[i + j] & 0x7F)
+            
+            i += chunk_size
+        
+        return result
+        
+        # Bridge → Nowde Direct (0x01-0x0F)
+        self.SYSEX_CMD_QUERY_CONFIG = 0x01
+        self.SYSEX_CMD_PUSH_FULL_CONFIG = 0x02
+        self.SYSEX_CMD_QUERY_RUNNING_STATE = 0x03
+        
+        # Bridge → Receivers via Sender (0x10-0x1F)
+        self.SYSEX_CMD_MEDIA_SYNC = 0x10
+        self.SYSEX_CMD_CHANGE_RECEIVER_LAYER = 0x11
+        
+        # Nowde → Bridge Responses (0x20-0x3F)
+        self.SYSEX_CMD_CONFIG_STATE = 0x20
+        self.SYSEX_CMD_RUNNING_STATE = 0x21
+        self.SYSEX_CMD_ERROR_REPORT = 0x30
 
     def get_ports(self):
         """Get list of available MIDI output ports"""
@@ -149,13 +191,13 @@ class OutputManager:
     def send_media_sync(self, layer_name, media_index, position_ms, state):
         """Send 'Media Sync' SysEx message with media index, position, and state
         
-        Packet format (26 bytes total):
-        F0 7D 05 [layer_name(16 bytes)] [media_index(1)] [position_ms(4)] [state(1)] F7
+        Packet format (encoded):
+        F0 7D 10 [layer_name(16 bytes)] [media_index(1)] [position_ms_encoded(5 bytes)] [state(1)] F7
         
         Args:
             layer_name: Layer name (max 16 chars)
             media_index: Media index 0-127 (0=stop, 1-127=media number)
-            position_ms: Position in milliseconds (uint32, 4 bytes)
+            position_ms: Position in milliseconds (uint32, 4 bytes raw -> 5 bytes encoded)
             state: 0=stopped, 1=playing
         """
         if not self.current_port:
@@ -170,19 +212,20 @@ class OutputManager:
         # Convert state to byte (0=stopped, 1=playing)
         state_byte = 1 if state == 'playing' else 0
         
-        # Convert position_ms to 4 bytes (big-endian uint32)
-        position_bytes = [
+        # Convert position_ms to 4 bytes (big-endian uint32) and 7-bit encode
+        position_bytes_raw = [
             (position_ms >> 24) & 0xFF,
             (position_ms >> 16) & 0xFF,
             (position_ms >> 8) & 0xFF,
             position_ms & 0xFF
         ]
+        position_bytes_encoded = self.encode_7bit(position_bytes_raw)
         
         message = ([self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
                    self.SYSEX_CMD_MEDIA_SYNC] + 
                    list(layer_bytes) + 
                    [media_index] + 
-                   position_bytes + 
+                   position_bytes_encoded + 
                    [state_byte] + 
                    [self.SYSEX_END])
         
@@ -232,13 +275,22 @@ class OutputManager:
         
         elif cmd == self.SYSEX_CMD_MEDIA_SYNC:
             # Extract layer, index, position, state
-            # Format: F0 7D 05 [Layer(16)] [Index(1)] [Position(4)] [State(1)] F7
-            if len(message) >= 26:  # F0 7D 05 + 16 Layer + 1 Index + 4 Position + 1 State + F7
+            # Format: F0 7D 10 [Layer(16)] [Index(1)] [Position_encoded(5)] [State(1)] F7
+            if len(message) >= 27:  # F0 7D 10 + 16 Layer + 1 Index + 5 Position_encoded + 1 State + F7
                 layer_bytes = message[3:19]
                 layer_name = bytes(layer_bytes).decode('ascii', errors='ignore').rstrip('\x00')
                 media_index = message[19]
-                position_ms = (message[20] << 24) | (message[21] << 16) | (message[22] << 8) | message[23]
-                state_byte = message[24]
+                # Decode 7-bit encoded position (5 bytes -> 4 bytes)
+                position_encoded = message[20:25]
+                msb_byte = position_encoded[0]
+                position_bytes = []
+                for i in range(4):
+                    byte_val = position_encoded[i + 1]
+                    if msb_byte & (1 << i):
+                        byte_val |= 0x80
+                    position_bytes.append(byte_val)
+                position_ms = (position_bytes[0] << 24) | (position_bytes[1] << 16) | (position_bytes[2] << 8) | position_bytes[3]
+                state_byte = message[25]
                 state_str = "playing" if state_byte == 1 else "stopped"
                 position_s = position_ms / 1000.0
                 return f"SysEx: Media Sync Layer='{layer_name}', Index={media_index}, Pos={position_s:.2f}s, State={state_str}"
