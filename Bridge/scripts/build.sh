@@ -22,6 +22,10 @@ fi
 
 echo -e "${BLUE}Platform detected: ${PLATFORM}${NC}"
 
+# Install build dependencies
+echo -e "${BLUE}Installing build dependencies...${NC}"
+uv sync --extra dev
+
 # Create dist directory
 mkdir -p dist
 
