@@ -1,7 +1,7 @@
 {
   "sender_config": {
     "rf_simulation_enabled": false,
-    "rf_simulation_max_delay_ms": 187
+    "rf_simulation_max_delay_ms": 200
   },
   "gui_preferences": {
     "window_position": [

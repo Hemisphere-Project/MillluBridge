@@ -1358,7 +1358,7 @@ class MilluBridge:
         """Callback when simulation clock duration is changed"""
         self.simulation_clock_duration = dpg.get_value("sim_clock_duration_slider")
     
-    def toggle_simulation_clock(self):
+    def toggle_simulation_clock(self, *args, **kwargs):
         """Start/stop the simulation clock"""
         if self.simulation_clock_running:
             # Stop clock
