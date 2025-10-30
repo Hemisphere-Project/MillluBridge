@@ -139,6 +139,16 @@ class MilluBridge:
         # Layer editing modal state
         self.editing_layer_mac = None  # Track which device is being edited
         
+        # Simulation state
+        self.simulation_settings = {
+            'mac': {}  # {mac: 'Disabled' | 'Stop' | '1'-'10'}
+        }
+        self.simulation_clock_running = False
+        self.simulation_clock_duration = 30.0  # seconds
+        self.simulation_clock_position = 0.0  # current position
+        self.simulation_clock_thread = None
+        self.stop_simulation_clock = False
+        
         # Media synchronization settings (configurable)
         self.sync_settings = {
             'mtc_framerate': 30,  # fps
@@ -340,6 +350,13 @@ class MilluBridge:
             # MIDI Settings section
             dpg.add_text("Local Nowde", color=(150, 200, 255))
             
+            # Nowde device selection
+            with dpg.group(horizontal=True):
+                dpg.add_text("Select Device:")
+                dpg.add_combo(tag="nowde_device_combo", items=["Scanning..."], width=250,
+                             callback=self.on_nowde_device_selected)
+                dpg.add_button(label="Refresh", callback=self.manual_refresh_nowde_devices, width=80)
+            
             # Nowde connection status
             with dpg.group(horizontal=True):
                 dpg.add_text("USB Status:")
@@ -358,6 +375,26 @@ class MilluBridge:
                                  min_value=1, max_value=1000, width=150,
                                  callback=self.on_rf_sim_max_delay_changed)
                 dpg.add_text("ms")
+            
+            dpg.add_separator()
+            
+            # Simulation Clock control
+            dpg.add_text("Media Simulation", color=(150, 200, 255))
+            with dpg.group(horizontal=True):
+                dpg.add_text("Clock Duration:")
+                dpg.add_slider_float(tag="sim_clock_duration_slider",
+                                    default_value=30.0,
+                                    min_value=5.0, max_value=120.0,
+                                    width=150, format="%.1f",
+                                    callback=self.on_sim_clock_duration_changed)
+                dpg.add_text("s")
+                dpg.add_button(label="Start/Stop", tag="sim_clock_btn",
+                             callback=self.toggle_simulation_clock, width=100)
+                dpg.add_text("Stopped", tag="sim_clock_status", color=(150, 150, 150))
+            
+            with dpg.group(horizontal=True):
+                dpg.add_text("Clock Position:")
+                dpg.add_text("0.0s / 30.0s", tag="sim_clock_position_text", color=(150, 150, 150))
             
             # Nowde Logs section (hidden by default)
             with dpg.group(tag="nowde_logs_section", show=False):
@@ -381,7 +418,8 @@ class MilluBridge:
                 dpg.add_table_column(label="Version", width_fixed=True, init_width_or_weight=80)
                 dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=80)
                 dpg.add_table_column(label="Index", width_fixed=True, init_width_or_weight=60)
-                dpg.add_table_column(label="Layer", width_stretch=True)
+                dpg.add_table_column(label="Layer", width_fixed=True, init_width_or_weight=150)
+                dpg.add_table_column(label="Simulate", width_fixed=True, init_width_or_weight=100)
 
     def handle_sysex_message(self, msg_type, data):
         """Handle parsed SysEx messages from Nowde"""
@@ -585,6 +623,11 @@ class MilluBridge:
         seen_macs = set(self.remote_nowdes.keys())
         existing_rows = set()
         
+        # Initialize simulation settings for new devices
+        for mac in seen_macs:
+            if mac not in self.simulation_settings['mac']:
+                self.simulation_settings['mac'][mac] = 'Disabled'
+        
         # Get existing rows
         children = dpg.get_item_children("remote_nowdes_table", slot=1)
         if children:
@@ -627,6 +670,7 @@ class MilluBridge:
             state_tag = f"nowde_state_{mac}"
             index_tag = f"nowde_index_{mac}"
             layer_btn_tag = f"layer_btn_{mac}"
+            sim_combo_tag = f"sim_combo_{mac}"
             
             if mac in existing_rows:
                 # Update existing row
@@ -645,8 +689,12 @@ class MilluBridge:
                     dpg.configure_item(index_tag, color=text_color)
                 if dpg.does_item_exist(layer_btn_tag):
                     dpg.configure_item(layer_btn_tag, label=nowde.get('layer', '-'))
+                # Simulation combo is handled by callback, no need to update
             else:
                 # Create new row
+                sim_options = ['Disabled', 'Stop'] + [str(i) for i in range(1, 11)]
+                current_sim = self.simulation_settings['mac'].get(mac, 'Disabled')
+                
                 with dpg.table_row(parent="remote_nowdes_table", tag=row_tag):
                     dpg.add_text(nowde['uuid'], tag=uuid_tag, color=text_color)
                     dpg.add_text(nowde.get('version', '?'), tag=version_tag, color=text_color)
@@ -656,8 +704,16 @@ class MilluBridge:
                     dpg.add_button(
                         tag=layer_btn_tag,
                         label=nowde.get('layer', '-'),
-                        width=150,
+                        width=140,
                         callback=lambda s, a, u: self.open_layer_editor(u['mac']),
+                        user_data={'mac': mac}
+                    )
+                    dpg.add_combo(
+                        tag=sim_combo_tag,
+                        items=sim_options,
+                        default_value=current_sim,
+                        width=90,
+                        callback=lambda s, a, u: self.on_simulation_mode_changed(u['mac'], a),
                         user_data={'mac': mac}
                     )
     
@@ -671,6 +727,15 @@ class MilluBridge:
         # Log message (filtered or all)
         if self.show_all_messages or is_millumin:
             self.update_osc_log(message)
+    
+    def is_layer_in_simulation(self, layer_name):
+        """Check if any Remote Nowde is simulating this layer"""
+        for mac, nowde in self.remote_nowdes.items():
+            if nowde.get('layer') == layer_name:
+                sim_mode = self.simulation_settings['mac'].get(mac, 'Disabled')
+                if sim_mode != 'Disabled':
+                    return True
+        return False
     
     def parse_millumin_message(self, message):
         """Parse Millumin OSC messages and update layer tracking"""
@@ -695,6 +760,10 @@ class MilluBridge:
             
             layer_name, route = path.split("/", 1)
             route = "/" + route  # Add back the leading slash
+            
+            # Check if this layer is being simulated - if so, discard real messages
+            if self.is_layer_in_simulation(layer_name):
+                return False
             
             # Parse arguments - remove parentheses and split by comma
             args_str = args_str.strip().strip("()")
@@ -900,7 +969,7 @@ class MilluBridge:
                 dpg.set_y_scroll("midi_log_window", dpg.get_y_scroll_max("midi_log_window"))
     
     def refresh_midi_devices(self):
-        """Find and connect to first Nowde device (single-device mode)"""
+        """Refresh available Nowde devices and update dropdown"""
         # Get all available ports (union of input and output)
         try:
             out_ports = set(self.output_manager.get_ports())
@@ -913,29 +982,51 @@ class MilluBridge:
                 self.disconnect_nowde_device()
             return
         
+        # Filter for Nowde devices
+        nowde_devices = [port for port in all_ports if port.startswith("Nowde")]
+        
+        # Update combo box with available Nowde devices
+        if dpg.does_item_exist("nowde_device_combo"):
+            if nowde_devices:
+                dpg.configure_item("nowde_device_combo", items=nowde_devices)
+                # If connected device is still in the list, keep it selected
+                if self.current_nowde_device in nowde_devices:
+                    dpg.set_value("nowde_device_combo", self.current_nowde_device)
+                # If no device connected, auto-connect to first available
+                elif not self.current_nowde_device:
+                    dpg.set_value("nowde_device_combo", nowde_devices[0])
+                    self.connect_nowde_device(nowde_devices[0])
+            else:
+                dpg.configure_item("nowde_device_combo", items=["No Nowde devices found"])
+                dpg.set_value("nowde_device_combo", "No Nowde devices found")
+        
         # Check if currently connected device is still available
         if self.current_nowde_device:
             device_still_present = self.current_nowde_device in all_ports
             
-            if device_still_present:
-                # Current device still present and working, keep connection
-                return
-            else:
+            if not device_still_present:
                 # Current device disconnected
                 self.disconnect_nowde_device()
+    
+    def manual_refresh_nowde_devices(self):
+        """Manual refresh button callback"""
+        self.refresh_midi_devices()
+        self.update_osc_log("Refreshed Nowde device list")
+    
+    def on_nowde_device_selected(self, sender, app_data):
+        """Callback when user selects a Nowde device from dropdown"""
+        selected_device = app_data
         
-        # Only try to connect if we don't have a device
-        # Find first device starting with "Nowde"
-        if not self.current_nowde_device:
-            nowde_device = None
-            for port in all_ports:
-                if port.startswith("Nowde"):
-                    nowde_device = port
-                    break
-            
-            # Connect to the first Nowde found
-            if nowde_device:
-                self.connect_nowde_device(nowde_device)
+        # Ignore placeholder values
+        if selected_device in ["Scanning...", "No Nowde devices found"]:
+            return
+        
+        # If already connected to this device, do nothing
+        if self.current_nowde_device == selected_device:
+            return
+        
+        # Connect to the selected device
+        self.connect_nowde_device(selected_device)
     
     def connect_nowde_device(self, device_name):
         """Connect to a Nowde device"""
@@ -951,6 +1042,11 @@ class MilluBridge:
         if out_success or in_success:
             self.current_nowde_device = device_name
             self.selected_port = device_name
+            
+            # Update combo box selection
+            if dpg.does_item_exist("nowde_device_combo"):
+                dpg.set_value("nowde_device_combo", device_name)
+            
             self.update_nowde_status(True, device_name)
             self.update_osc_log(f"Nowde connected: {device_name}")
             
@@ -979,6 +1075,12 @@ class MilluBridge:
             # Clear remote nowdes table
             self.remote_nowdes.clear()
             self.update_remote_nowdes_table()
+            
+            # Update combo box to show no selection
+            if dpg.does_item_exist("nowde_device_combo"):
+                current_items = dpg.get_item_configuration("nowde_device_combo").get("items", [])
+                if current_items and current_items[0] != "No Nowde devices found":
+                    dpg.set_value("nowde_device_combo", "")
             
             self.update_nowde_status(False, None)
     
@@ -1247,10 +1349,108 @@ class MilluBridge:
         """Restart MIDI device (kept for compatibility but not used with auto-selection)"""
         pass
     
+    def on_simulation_mode_changed(self, mac, mode):
+        """Callback when simulation mode is changed for a Remote Nowde"""
+        self.simulation_settings['mac'][mac] = mode
+        self.update_osc_log(f"Simulation for {self.remote_nowdes.get(mac, {}).get('uuid', mac)}: {mode}")
+    
+    def on_sim_clock_duration_changed(self, sender, app_data):
+        """Callback when simulation clock duration is changed"""
+        self.simulation_clock_duration = dpg.get_value("sim_clock_duration_slider")
+    
+    def toggle_simulation_clock(self):
+        """Start/stop the simulation clock"""
+        if self.simulation_clock_running:
+            # Stop clock
+            self.stop_simulation_clock = True
+            self.simulation_clock_running = False
+            if dpg.does_item_exist("sim_clock_btn"):
+                dpg.set_value("sim_clock_btn", "Start Clock")
+            if dpg.does_item_exist("sim_clock_status"):
+                dpg.set_value("sim_clock_status", "Stopped")
+                dpg.configure_item("sim_clock_status", color=(150, 150, 150))
+        else:
+            # Start clock
+            self.simulation_clock_position = 0.0
+            self.stop_simulation_clock = False
+            self.simulation_clock_running = True
+            if dpg.does_item_exist("sim_clock_btn"):
+                dpg.set_value("sim_clock_btn", "Stop Clock")
+            if dpg.does_item_exist("sim_clock_status"):
+                dpg.set_value("sim_clock_status", "Running")
+                dpg.configure_item("sim_clock_status", color=(0, 255, 0))
+            
+            # Start clock thread
+            if self.simulation_clock_thread is None or not self.simulation_clock_thread.is_alive():
+                self.simulation_clock_thread = threading.Thread(target=self.simulation_clock_loop, daemon=True)
+                self.simulation_clock_thread.start()
+    
+    def simulation_clock_loop(self):
+        """Background thread for simulation clock"""
+        import time
+        
+        last_time = time.time()
+        
+        while self.simulation_clock_running and not self.stop_simulation_clock:
+            current_time = time.time()
+            delta = current_time - last_time
+            last_time = current_time
+            
+            # Update clock position
+            self.simulation_clock_position += delta
+            
+            # Loop back to 0 when reaching duration
+            if self.simulation_clock_position >= self.simulation_clock_duration:
+                self.simulation_clock_position = 0.0
+            
+            # Update GUI
+            if dpg.does_item_exist("sim_clock_position_text"):
+                dpg.set_value("sim_clock_position_text", 
+                            f"{self.simulation_clock_position:.1f}s / {self.simulation_clock_duration:.1f}s")
+            
+            # Send sync messages to all Remote Nowdes in simulation mode
+            if self.current_nowde_device and self.output_manager.current_port:
+                position_ms = int(self.simulation_clock_position * 1000)
+                
+                for mac, nowde in self.remote_nowdes.items():
+                    sim_mode = self.simulation_settings['mac'].get(mac, 'Disabled')
+                    
+                    if sim_mode == 'Disabled':
+                        continue
+                    
+                    layer_name = nowde.get('layer', '')
+                    if not layer_name:
+                        continue
+                    
+                    # Determine media index and state
+                    if sim_mode == 'Stop':
+                        media_index = 0
+                        state = 'stopped'
+                    else:
+                        # sim_mode is '1' through '10'
+                        try:
+                            media_index = int(sim_mode)
+                            state = 'playing'
+                        except ValueError:
+                            continue
+                    
+                    # Send media sync
+                    self.output_manager.send_media_sync(
+                        layer_name=layer_name,
+                        media_index=media_index,
+                        position_ms=position_ms,
+                        state=state
+                    )
+            
+            # Sleep for throttle interval
+            time.sleep(self.sync_settings['throttle_interval'])
+    
     def on_quit(self):
         """Callback for Quit button"""
         self.stop_midi_refresh = True
         self.stop_media_sync = True
+        self.stop_simulation_clock = True
+        self.simulation_clock_running = False
         if self.is_running:
             self.stop_bridge()
         dpg.stop_dearpygui()
@@ -1282,6 +1482,8 @@ class MilluBridge:
         self.stop_midi_refresh = True
         self.stop_media_sync = True
         self.stop_running_state = True
+        self.stop_simulation_clock = True
+        self.simulation_clock_running = False
         if self.is_running:
             self.stop_bridge()
         

@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "millubridge"
+version = "1.0.0"
+description = "OSC to MIDI bridge with ESP-NOW mesh synchronization for media playback"
+authors = [
+    {name = "Hemisphere Project", email = "contact@hemisphere-project.com"}
+]
+maintainers = [
+    {name = "maigre", email = "contact@hemisphere-project.com"}
+]
+readme = "README.md"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.8"
+keywords = ["osc", "midi", "bridge", "media", "sync", "millumin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Sound/Audio :: MIDI",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "python-osc>=1.8.0",
+    "python-rtmidi>=1.5.0",
+    "dearpygui>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+build = [
+    "pyinstaller>=6.0.0",
+    "nuitka>=2.0.0",
+]
+
+[project.scripts]
+millubridge = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/Hemisphere-Project/MillluBridge"
+Repository = "https://github.com/Hemisphere-Project/MillluBridge"
+Issues = "https://github.com/Hemisphere-Project/MillluBridge/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 120
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

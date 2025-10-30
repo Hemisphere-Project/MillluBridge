@@ -1,4 +1,0 @@
-
-python-osc
-python-rtmidi
-dearpygui
