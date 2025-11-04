@@ -1471,10 +1471,11 @@ class MilluBridge:
             
             self.update_osc_log("Uploading firmware data...")
             
-            # Send in ~200 byte chunks (will become ~230 bytes after 7-bit encoding + header/footer)
-            # This keeps SysEx messages under 256 bytes for safety
-            chunk_size = 200
+            # Use smaller chunks to avoid buffer overflow
+            # 100 bytes raw -> ~115 bytes encoded + headers = ~120 bytes total SysEx message
+            chunk_size = 100
             sent_bytes = 0
+            chunk_count = 0
             
             for i in range(0, firmware_size, chunk_size):
                 chunk = firmware_data[i:i+chunk_size]
@@ -1484,6 +1485,7 @@ class MilluBridge:
                     raise Exception(f"Failed to send OTA_DATA at offset {i}")
                 
                 sent_bytes += len(chunk)
+                chunk_count += 1
                 progress = 0.15 + (sent_bytes / firmware_size) * 0.75  # 15% to 90%
                 
                 if dpg.does_item_exist("firmware_upload_progress"):
@@ -1494,8 +1496,12 @@ class MilluBridge:
                 if percent % 10 == 0 and sent_bytes > 0:
                     self.update_osc_log(f"  Progress: {percent}% ({sent_bytes}/{firmware_size} bytes)")
                 
-                # Small delay between chunks to avoid overwhelming the device
-                time.sleep(0.01)
+                # Reduced delay - device sends ACK every 50 chunks to confirm it's keeping up
+                time.sleep(0.01)  # 10ms between chunks (faster!)
+            
+            # Wait for device to finish writing all buffered data to flash
+            self.update_osc_log("Waiting for device to finish writing to flash...")
+            time.sleep(2)  # Reduced from 3s
             
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.set_value("firmware_upload_progress", 0.9)
