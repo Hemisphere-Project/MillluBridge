@@ -1481,8 +1481,9 @@ class MilluBridge:
             sent_bytes = 0
             chunk_count = 0
             
-            # Adaptive timing - start conservative, speed up if device keeps up
-            chunk_delay = 0.025  # Start with 25ms
+            # Conservative timing to avoid USB buffer overflow
+            # ESP32 needs time to decode, write to flash, and process
+            chunk_delay = 0.025  # 25ms per chunk
             
             for i in range(0, firmware_size, chunk_size):
                 chunk = firmware_data[i:i+chunk_size]
@@ -1506,10 +1507,11 @@ class MilluBridge:
                 # Every 100 chunks, give device extra time for flash writes
                 if chunk_count % 100 == 0:
                     time.sleep(0.15)  # 150ms pause
-                    # After successful batch, speed up slightly
-                    chunk_delay = max(0.015, chunk_delay - 0.001)  # Gradually faster, min 15ms
                 else:
                     time.sleep(chunk_delay)
+            
+            # Log final byte count
+            self.update_osc_log(f"✅ Sent all {sent_bytes} bytes ({chunk_count} chunks)")
             
             # Wait for device to finish writing all buffered data to flash
             self.update_osc_log("Waiting for device to finish writing to flash...")
@@ -1543,19 +1545,24 @@ class MilluBridge:
             self.output_manager.close_port()
             self.input_manager.close_port()
             
-            # Wait for device to reboot
-            time.sleep(4)
+            # Wait longer for device to fully reboot and re-enumerate USB
+            # ESP32 needs time to: validate firmware, switch partitions, reboot, and reconnect
+            self.update_osc_log("Waiting for device to reboot and reconnect...")
+            time.sleep(8)  # 8 seconds for full reboot cycle
             
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.set_value("firmware_upload_progress", 1.0)
             
-            # Refresh MIDI devices
+            # Refresh MIDI devices to detect reconnected device
+            self.update_osc_log("Scanning for reconnected device...")
             self.refresh_midi_devices()
             
-            # Hide progress bar after a delay
+            # Hide progress bar and status after a delay
             time.sleep(2)
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.configure_item("firmware_upload_progress", show=False)
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "")
             
         except requests.exceptions.RequestException as e:
             error_msg = f"Download failed: {str(e)}"
