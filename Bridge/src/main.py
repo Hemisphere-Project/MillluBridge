@@ -408,41 +408,25 @@ class MilluBridge:
             
             # MIDI Settings section
             dpg.add_text("Local Nowde", color=(150, 200, 255))
-            
             # Nowde device selection
             with dpg.group(horizontal=True):
                 dpg.add_text("Select Device:")
                 dpg.add_combo(tag="nowde_device_combo", items=["Scanning..."], width=250,
                              callback=self.on_nowde_device_selected)
                 dpg.add_button(label="Refresh", callback=self.manual_refresh_nowde_devices, width=80)
-            
-            # Nowde connection status
-            with dpg.group(horizontal=True):
+                dpg.add_spacer(width=20)
                 dpg.add_text("USB Status:")
                 dpg.add_text("[X]", tag="nowde_status_indicator", color=(255, 0, 0))  # Red by default
                 dpg.add_text("Not connected", tag="nowde_status_text", color=(150, 150, 150))
                 dpg.add_button(label="Show Logs", tag="nowde_logs_toggle_btn", callback=self.toggle_nowde_logs, width=100)
             
-            # RF Simulation control
+            # Nowde version and firmware upgrade
             with dpg.group(horizontal=True):
-                dpg.add_checkbox(label="Simulate Bad RF", tag="rf_sim_checkbox",
-                               default_value=self.config['sender_config']['rf_simulation_enabled'],
-                               callback=self.on_rf_sim_changed)
-                dpg.add_text("Max Delay:")
-                dpg.add_slider_int(tag="rf_sim_max_delay_slider",
-                                 default_value=self.config['sender_config']['rf_simulation_max_delay_ms'],
-                                 min_value=1, max_value=1000, width=150,
-                                 callback=self.on_rf_sim_max_delay_changed)
-                dpg.add_text("ms")
-            
-            dpg.add_separator()
-            
-            # Firmware Upgrade section
-            dpg.add_text("Firmware Upgrade", color=(150, 200, 255))
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Upgrade Nowde", tag="upgrade_nowde_btn",
+                dpg.add_text("Nowde Version:")
+                dpg.add_text("--", tag="firmware_version_text", color=(150, 150, 150))
+                dpg.add_spacer(width=20)
+                dpg.add_button(label="Upgrade Firmware", tag="upgrade_nowde_btn",
                              callback=self.upgrade_nowde_firmware, width=150)
-                dpg.add_text("", tag="firmware_version_text", color=(150, 150, 150))
             dpg.add_progress_bar(tag="firmware_upload_progress", 
                                 default_value=0.0, width=-1, show=False)
             dpg.add_text("", tag="firmware_upload_status", color=(150, 150, 150))
@@ -462,10 +446,21 @@ class MilluBridge:
                 dpg.add_button(label="Start/Stop", tag="sim_clock_btn",
                              callback=self.toggle_simulation_clock, width=100)
                 dpg.add_text("Stopped", tag="sim_clock_status", color=(150, 150, 150))
-            
-            with dpg.group(horizontal=True):
-                dpg.add_text("Clock Position:")
+                dpg.add_spacer(width=20)
+                dpg.add_text("Position:")
                 dpg.add_text("0.0s / 30.0s", tag="sim_clock_position_text", color=(150, 150, 150))
+            
+            # RF Simulation control
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="Simulate Bad RF", tag="rf_sim_checkbox",
+                               default_value=self.config['sender_config']['rf_simulation_enabled'],
+                               callback=self.on_rf_sim_changed)
+                dpg.add_text("Max Delay:")
+                dpg.add_slider_int(tag="rf_sim_max_delay_slider",
+                                 default_value=self.config['sender_config']['rf_simulation_max_delay_ms'],
+                                 min_value=1, max_value=1000, width=150,
+                                 callback=self.on_rf_sim_max_delay_changed)
+                dpg.add_text("ms")
             
             # Nowde Logs section (hidden by default)
             with dpg.group(tag="nowde_logs_section", show=False):
@@ -508,6 +503,10 @@ class MilluBridge:
                 self.update_osc_log(f"Nowde REBOOT detected: v{version}, uptime {uptime_ms}ms, reason: {boot_reason}")
             
             self.log_nowde_message(f"HELLO: v{version}, Boot reason: {boot_reason}")
+            
+            # Update firmware version display
+            dpg.set_value("firmware_version_text", version)
+            dpg.configure_item("firmware_version_text", color=(100, 255, 100))  # Green when connected
             
             # Mark sender as initialized
             self.sender_initialized = True
@@ -1191,6 +1190,11 @@ class MilluBridge:
             self.selected_port = None
             self.sender_initialized = False  # Reset initialization flag
             
+            # Reset firmware version display
+            if dpg.does_item_exist("firmware_version_text"):
+                dpg.set_value("firmware_version_text", "--")
+                dpg.configure_item("firmware_version_text", color=(150, 150, 150))
+            
             # Clear remote nowdes table and tracking
             self.remote_nowdes.clear()
             self.remote_nowdes_last_update.clear()
@@ -1477,6 +1481,9 @@ class MilluBridge:
             sent_bytes = 0
             chunk_count = 0
             
+            # Adaptive timing - start conservative, speed up if device keeps up
+            chunk_delay = 0.025  # Start with 25ms
+            
             for i in range(0, firmware_size, chunk_size):
                 chunk = firmware_data[i:i+chunk_size]
                 result = self.output_manager.send_ota_data(chunk)
@@ -1494,14 +1501,19 @@ class MilluBridge:
                 # Log progress every 10%
                 percent = (sent_bytes * 100) // firmware_size
                 if percent % 10 == 0 and sent_bytes > 0:
-                    self.update_osc_log(f"  Progress: {percent}% ({sent_bytes}/{firmware_size} bytes)")
+                    self.update_osc_log(f"  Progress: {percent}% ({sent_bytes}/{firmware_size} bytes, {chunk_delay*1000:.0f}ms/chunk)")
                 
-                # Reduced delay - device sends ACK every 50 chunks to confirm it's keeping up
-                time.sleep(0.01)  # 10ms between chunks (faster!)
+                # Every 100 chunks, give device extra time for flash writes
+                if chunk_count % 100 == 0:
+                    time.sleep(0.15)  # 150ms pause
+                    # After successful batch, speed up slightly
+                    chunk_delay = max(0.015, chunk_delay - 0.001)  # Gradually faster, min 15ms
+                else:
+                    time.sleep(chunk_delay)
             
             # Wait for device to finish writing all buffered data to flash
             self.update_osc_log("Waiting for device to finish writing to flash...")
-            time.sleep(2)  # Reduced from 3s
+            time.sleep(2)
             
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.set_value("firmware_upload_progress", 0.9)
