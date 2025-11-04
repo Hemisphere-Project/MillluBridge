@@ -31,7 +31,10 @@ class OutputManager:
         self.SYSEX_CMD_QUERY_CONFIG = 0x01
         self.SYSEX_CMD_PUSH_FULL_CONFIG = 0x02
         self.SYSEX_CMD_QUERY_RUNNING_STATE = 0x03
-        self.SYSEX_CMD_ENTER_BOOTLOADER = 0x04
+        self.SYSEX_CMD_ENTER_BOOTLOADER = 0x04  # Deprecated
+        self.SYSEX_CMD_OTA_BEGIN = 0x05
+        self.SYSEX_CMD_OTA_DATA = 0x06
+        self.SYSEX_CMD_OTA_END = 0x07
         
         # Bridge → Receivers via Sender (0x10-0x1F)
         self.SYSEX_CMD_MEDIA_SYNC = 0x10
@@ -161,7 +164,7 @@ class OutputManager:
         return (True, self.format_sysex_message(message))
     
     def send_enter_bootloader(self):
-        """Send ENTER_BOOTLOADER command to trigger firmware update mode"""
+        """Send ENTER_BOOTLOADER command to trigger firmware update mode (DEPRECATED - use OTA)"""
         if not self.current_port:
             return False, "No MIDI port open"
         
@@ -171,6 +174,62 @@ class OutputManager:
         self.midi_out.send_message(message)
         print("Sent ENTER_BOOTLOADER SysEx")
         return (True, self.format_sysex_message(message))
+    
+    def send_ota_begin(self, firmware_size):
+        """Send OTA_BEGIN to start firmware update
+        
+        Args:
+            firmware_size: Size of firmware in bytes (uint32)
+        """
+        if not self.current_port:
+            return False, "No MIDI port open"
+        
+        # Convert size to 4 bytes and 7-bit encode
+        size_bytes = [
+            (firmware_size >> 24) & 0xFF,
+            (firmware_size >> 16) & 0xFF,
+            (firmware_size >> 8) & 0xFF,
+            firmware_size & 0xFF
+        ]
+        size_encoded = self.encode_7bit(size_bytes)
+        
+        # F0 7D 05 [size_encoded(5 bytes)] F7
+        message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
+                   self.SYSEX_CMD_OTA_BEGIN] + size_encoded + [self.SYSEX_END]
+        self.midi_out.send_message(message)
+        print(f"Sent OTA_BEGIN: {firmware_size} bytes")
+        return (True, f"OTA BEGIN: {firmware_size} bytes")
+    
+    def send_ota_data(self, data_chunk):
+        """Send OTA_DATA chunk (7-bit encoded)
+        
+        Args:
+            data_chunk: Bytes to send (will be 7-bit encoded)
+        """
+        if not self.current_port:
+            return False, "No MIDI port open"
+        
+        # 7-bit encode the data
+        encoded = self.encode_7bit(list(data_chunk))
+        
+        # F0 7D 06 [data_encoded] F7
+        message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
+                   self.SYSEX_CMD_OTA_DATA] + encoded + [self.SYSEX_END]
+        
+        self.midi_out.send_message(message)
+        return (True, f"OTA DATA: {len(data_chunk)} bytes")
+    
+    def send_ota_end(self):
+        """Send OTA_END to finalize firmware update"""
+        if not self.current_port:
+            return False, "No MIDI port open"
+        
+        # F0 7D 07 F7
+        message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
+                   self.SYSEX_CMD_OTA_END, self.SYSEX_END]
+        self.midi_out.send_message(message)
+        print("Sent OTA_END")
+        return (True, "OTA END")
     
     def send_change_receiver_layer(self, mac_address, layer_name):
         """Send 'Change Receiver Layer' SysEx message to update a specific receiver's layer

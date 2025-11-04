@@ -1429,80 +1429,109 @@ class MilluBridge:
         thread.start()
     
     def _upgrade_firmware_thread(self):
-        """Background thread for firmware upgrade"""
+        """Background thread for firmware upgrade via OTA"""
         firmware_file = None
         try:
             # Step 1: Download firmware from GitHub
             self.update_osc_log("Downloading firmware from GitHub...")
-            firmware_url = "https://raw.githubusercontent.com/Hemisphere-Project/MilluBridge/main/Nowde/bin/firmware.bin"
+            firmware_url = "https://github.com/Hemisphere-Project/MillluBridge/raw/refs/heads/main/Nowde/bin/firmware.bin"
             
-            # Create temp file
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.bin')
-            firmware_file = temp_file.name
-            temp_file.close()
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Downloading...")
             
             # Download with timeout
             response = requests.get(firmware_url, timeout=30)
             response.raise_for_status()
             
-            with open(firmware_file, 'wb') as f:
-                f.write(response.content)
-            
-            firmware_size = len(response.content)
+            firmware_data = response.content
+            firmware_size = len(firmware_data)
             self.update_osc_log(f"✅ Downloaded firmware ({firmware_size} bytes)")
             
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.set_value("firmware_upload_progress", 0.1)
             
-            # Step 2: Send Enter Bootloader command
+            # Step 2: Send OTA_BEGIN
             if dpg.does_item_exist("firmware_upload_status"):
-                dpg.set_value("firmware_upload_status", "Entering bootloader mode...")
+                dpg.set_value("firmware_upload_status", "Starting OTA update...")
             
-            self.update_osc_log("Sending Enter Bootloader command...")
-            result = self.output_manager.send_enter_bootloader()
+            self.update_osc_log("Starting OTA update...")
+            result = self.output_manager.send_ota_begin(firmware_size)
             
             if not result or not result[0]:
-                raise Exception("Failed to send bootloader command")
+                raise Exception("Failed to send OTA_BEGIN")
             
-            # Step 3: Close MIDI ports (device will disconnect)
+            time.sleep(0.2)  # Give device time to prepare
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.set_value("firmware_upload_progress", 0.15)
+            
+            # Step 3: Send firmware data in chunks
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Uploading firmware...")
+            
+            self.update_osc_log("Uploading firmware data...")
+            
+            # Send in ~200 byte chunks (will become ~230 bytes after 7-bit encoding + header/footer)
+            # This keeps SysEx messages under 256 bytes for safety
+            chunk_size = 200
+            sent_bytes = 0
+            
+            for i in range(0, firmware_size, chunk_size):
+                chunk = firmware_data[i:i+chunk_size]
+                result = self.output_manager.send_ota_data(chunk)
+                
+                if not result or not result[0]:
+                    raise Exception(f"Failed to send OTA_DATA at offset {i}")
+                
+                sent_bytes += len(chunk)
+                progress = 0.15 + (sent_bytes / firmware_size) * 0.75  # 15% to 90%
+                
+                if dpg.does_item_exist("firmware_upload_progress"):
+                    dpg.set_value("firmware_upload_progress", progress)
+                
+                # Log progress every 10%
+                percent = (sent_bytes * 100) // firmware_size
+                if percent % 10 == 0 and sent_bytes > 0:
+                    self.update_osc_log(f"  Progress: {percent}% ({sent_bytes}/{firmware_size} bytes)")
+                
+                # Small delay between chunks to avoid overwhelming the device
+                time.sleep(0.01)
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.set_value("firmware_upload_progress", 0.9)
+            
+            # Step 4: Send OTA_END
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Finalizing update...")
+            
+            self.update_osc_log("Finalizing firmware update...")
+            result = self.output_manager.send_ota_end()
+            
+            if not result or not result[0]:
+                raise Exception("Failed to send OTA_END")
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.set_value("firmware_upload_progress", 0.95)
+            
+            # Step 5: Device will reboot automatically
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "✅ Update complete! Device rebooting...")
+                dpg.configure_item("firmware_upload_status", color=(0, 255, 0))
+            
+            self.update_osc_log("✅ Firmware update successful! Device rebooting...")
+            
+            # Close MIDI ports to allow device to reconnect
+            time.sleep(1)
             self.output_manager.close_port()
             self.input_manager.close_port()
             
-            # Step 4: Wait for device to reboot into bootloader
-            if dpg.does_item_exist("firmware_upload_status"):
-                dpg.set_value("firmware_upload_status", "Waiting for bootloader...")
-            
-            self.update_osc_log("Waiting for bootloader...")
-            time.sleep(3)  # Give device time to reboot
-            
-            if dpg.does_item_exist("firmware_upload_progress"):
-                dpg.set_value("firmware_upload_progress", 0.2)
-            
-            # Step 5: Find USB serial port
-            serial_port = self._find_esp32_serial_port()
-            if not serial_port:
-                raise Exception("Could not find ESP32 bootloader port. Try manually resetting the device.")
-            
-            self.update_osc_log(f"Found bootloader on: {serial_port}")
-            
-            # Step 6: Flash firmware using esptool
-            if dpg.does_item_exist("firmware_upload_status"):
-                dpg.set_value("firmware_upload_status", "Flashing firmware...")
-            
-            self._flash_firmware(serial_port, firmware_file)
-            
-            # Step 7: Success!
-            if dpg.does_item_exist("firmware_upload_status"):
-                dpg.set_value("firmware_upload_status", "✅ Upgrade complete! Device rebooting...")
-                dpg.configure_item("firmware_upload_status", color=(0, 255, 0))
+            # Wait for device to reboot
+            time.sleep(4)
             
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.set_value("firmware_upload_progress", 1.0)
             
-            self.update_osc_log("✅ Firmware upgrade successful!")
-            
-            # Step 8: Wait for device to reboot and reconnect
-            time.sleep(4)
+            # Refresh MIDI devices
             self.refresh_midi_devices()
             
             # Hide progress bar after a delay
@@ -1511,7 +1540,7 @@ class MilluBridge:
                 dpg.configure_item("firmware_upload_progress", show=False)
             
         except requests.exceptions.RequestException as e:
-            error_msg = f"Failed to download firmware from GitHub: {str(e)}"
+            error_msg = f"Download failed: {str(e)}"
             self.update_osc_log(f"❌ {error_msg}")
             
             if dpg.does_item_exist("firmware_upload_status"):
@@ -1522,7 +1551,7 @@ class MilluBridge:
                 dpg.configure_item("firmware_upload_progress", show=False)
             
         except Exception as e:
-            error_msg = f"Firmware upgrade failed: {str(e)}"
+            error_msg = f"OTA update failed: {str(e)}"
             self.update_osc_log(f"❌ {error_msg}")
             
             if dpg.does_item_exist("firmware_upload_status"):
@@ -1535,77 +1564,6 @@ class MilluBridge:
             # Try to reconnect to MIDI anyway
             time.sleep(1)
             self.refresh_midi_devices()
-        
-        finally:
-            # Clean up temp file
-            if firmware_file and os.path.exists(firmware_file):
-                try:
-                    os.unlink(firmware_file)
-                except:
-                    pass
-    
-    def _find_esp32_serial_port(self):
-        """Find ESP32 bootloader serial port"""
-        # Platform-specific patterns
-        if os.uname().sysname == 'Darwin':  # macOS
-            patterns = ['/dev/cu.usbmodem*', '/dev/tty.usbmodem*']
-        elif os.name == 'posix':  # Linux
-            patterns = ['/dev/ttyACM*', '/dev/ttyUSB*']
-        else:  # Windows
-            patterns = ['COM*']
-        
-        for pattern in patterns:
-            ports = glob.glob(pattern)
-            if ports:
-                return ports[0]  # Return first match
-        
-        return None
-    
-    def _flash_firmware(self, port, firmware_file):
-        """Flash firmware using esptool"""
-        # esptool.py command for ESP32-S3
-        cmd = [
-            'python3', '-m', 'esptool',
-            '--chip', 'esp32s3',
-            '--port', port,
-            '--baud', '921600',  # Fast baud rate
-            'write_flash',
-            '0x0', firmware_file  # Flash at address 0x0
-        ]
-        
-        # Run esptool with progress output
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True
-        )
-        
-        # Parse output for progress
-        for line in process.stdout:
-            line = line.strip()
-            
-            # Update log (but skip repetitive lines)
-            if line and not line.startswith("Writing at"):
-                self.update_osc_log(f"  {line}")
-            
-            # Parse progress (esptool outputs "Writing at 0x00008000... (50 %)")
-            if "Writing at" in line and "%" in line:
-                try:
-                    percent_str = line.split("(")[1].split("%")[0].strip()
-                    percent = float(percent_str) / 100.0
-                    # Map to 0.2-1.0 range (0-0.2 was download/prep)
-                    progress = 0.2 + (percent * 0.8)
-                    
-                    if dpg.does_item_exist("firmware_upload_progress"):
-                        dpg.set_value("firmware_upload_progress", progress)
-                except:
-                    pass
-        
-        # Check result
-        return_code = process.wait()
-        if return_code != 0:
-            raise Exception(f"esptool failed with code {return_code}")
     
     def on_osc_settings_changed(self, sender, app_data):
         """Callback when OSC settings are changed"""
