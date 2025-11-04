@@ -186,3 +186,9 @@ uv.lock
 *.log
 *.db
 config.ini
+
+# Auto-generated icon files (generated from icon.png)
+icon.icns
+icon-linux.png
+icon-processed.png
+icon.iconset/

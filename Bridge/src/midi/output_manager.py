@@ -31,6 +31,7 @@ class OutputManager:
         self.SYSEX_CMD_QUERY_CONFIG = 0x01
         self.SYSEX_CMD_PUSH_FULL_CONFIG = 0x02
         self.SYSEX_CMD_QUERY_RUNNING_STATE = 0x03
+        self.SYSEX_CMD_ENTER_BOOTLOADER = 0x04
         
         # Bridge → Receivers via Sender (0x10-0x1F)
         self.SYSEX_CMD_MEDIA_SYNC = 0x10
@@ -157,6 +158,18 @@ class OutputManager:
                    self.SYSEX_CMD_QUERY_RUNNING_STATE, self.SYSEX_END]
         self.midi_out.send_message(message)
         # print("Sent QUERY_RUNNING_STATE SysEx")
+        return (True, self.format_sysex_message(message))
+    
+    def send_enter_bootloader(self):
+        """Send ENTER_BOOTLOADER command to trigger firmware update mode"""
+        if not self.current_port:
+            return False, "No MIDI port open"
+        
+        # F0 7D 04 F7
+        message = [self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
+                   self.SYSEX_CMD_ENTER_BOOTLOADER, self.SYSEX_END]
+        self.midi_out.send_message(message)
+        print("Sent ENTER_BOOTLOADER SysEx")
         return (True, self.format_sysex_message(message))
     
     def send_change_receiver_layer(self, mac_address, layer_name):

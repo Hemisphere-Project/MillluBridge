@@ -23,6 +23,43 @@ import threading
 import re
 import json
 import os
+from pathlib import Path
+import subprocess
+import glob
+import tempfile
+import requests
+
+
+def get_config_path():
+    """Get platform-appropriate config file path
+    
+    Returns path to config.json in:
+    - macOS: ~/Library/Application Support/MilluBridge/config.json
+    - Linux: ~/.config/millubridge/config.json
+    - Windows: %APPDATA%/MilluBridge/config.json
+    - Fallback: ./config.json (current directory)
+    """
+    if os.name == 'posix':
+        # macOS and Linux
+        if os.uname().sysname == 'Darwin':
+            # macOS
+            config_dir = Path.home() / "Library" / "Application Support" / "MilluBridge"
+        else:
+            # Linux
+            config_dir = Path.home() / ".config" / "millubridge"
+    elif os.name == 'nt':
+        # Windows
+        appdata = os.getenv('APPDATA')
+        config_dir = Path(appdata) / "MilluBridge" if appdata else Path(".")
+    else:
+        # Fallback
+        config_dir = Path(".")
+    
+    # Create directory if it doesn't exist
+    if config_dir != Path("."):
+        config_dir.mkdir(parents=True, exist_ok=True)
+    
+    return config_dir / "config.json"
 
 class MediaSyncManager:
     """Manages media synchronization state and throttling for each layer"""
@@ -104,7 +141,7 @@ class MediaSyncManager:
 class MilluBridge:
     def __init__(self, osc_address=None, osc_port=None):
         # Load config first
-        self.config_file = "config.json"
+        self.config_file = str(get_config_path())
         self.config = self.load_config()
         
         # Use provided values or fall back to config
@@ -128,6 +165,9 @@ class MilluBridge:
         self.current_nowde_device = None
         self.sender_initialized = False  # Set to True after receiving HELLO
         
+        # MIDI device name mapping (display name -> full name)
+        self.nowde_device_map = {}  # {display_name: full_name}
+        
         # Millumin layer tracking
         self.layers = {}  # {layer_name: {state, filename, position, duration}}
         self.layer_rows = {}  # {layer_name: row_tag} - track row tags for updates
@@ -135,6 +175,7 @@ class MilluBridge:
         
         # Remote Nowdes tracking
         self.remote_nowdes = {}  # {mac: {name, version, layer}}
+        self.remote_nowdes_last_update = {}  # {mac: timestamp} - track when we last received update from Nowde
         
         # Layer editing modal state
         self.editing_layer_mac = None  # Track which device is being edited
@@ -166,6 +207,10 @@ class MilluBridge:
         # Create DearPyGUI context
         dpg.create_context()
         
+        # Configure DearPyGUI to not save ini file (prevents file access permission prompts on macOS)
+        # Window positions are saved in our config.json instead
+        dpg.configure_app(init_file="")
+        
         # Setup window
         self.setup_gui()
         
@@ -183,7 +228,10 @@ class MilluBridge:
 
     def load_config(self):
         """Load configuration from config.json, forcing RF sim to disabled"""
+        first_run = False
+        
         try:
+            # Load config from proper location (no migration needed for .app bundles)
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
@@ -211,8 +259,19 @@ class MilluBridge:
                 print(f"Config loaded from {self.config_file}")
                 return config
             else:
-                print(f"No config file found, using defaults")
-                return self.get_default_config()
+                print(f"No config file found, creating with defaults")
+                first_run = True
+                config = self.get_default_config()
+                
+                # Save default config for first run
+                try:
+                    with open(self.config_file, 'w') as f:
+                        json.dump(config, f, indent=2)
+                    print(f"✅ Default config saved to {self.config_file}")
+                except Exception as e:
+                    print(f"⚠️ Could not save default config: {e}")
+                
+                return config
                 
         except Exception as e:
             print(f"Error loading config: {e}, using defaults")
@@ -378,6 +437,18 @@ class MilluBridge:
             
             dpg.add_separator()
             
+            # Firmware Upgrade section
+            dpg.add_text("Firmware Upgrade", color=(150, 200, 255))
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Upgrade Nowde", tag="upgrade_nowde_btn",
+                             callback=self.upgrade_nowde_firmware, width=150)
+                dpg.add_text("", tag="firmware_version_text", color=(150, 150, 150))
+            dpg.add_progress_bar(tag="firmware_upload_progress", 
+                                default_value=0.0, width=-1, show=False)
+            dpg.add_text("", tag="firmware_upload_status", color=(150, 150, 150))
+            
+            dpg.add_separator()
+            
             # Simulation Clock control
             dpg.add_text("Media Simulation", color=(150, 200, 255))
             with dpg.group(horizontal=True):
@@ -478,18 +549,32 @@ class MilluBridge:
         
         elif msg_type == 'running_state':
             # Incrementally update remote Nowdes table from receiver list
-            # Don't clear the dict - just update/add entries
+            # Keep devices even if not in latest message (15-min retention in UI logic)
+            import time
+            current_time = time.time()
             received_macs = set()
+            
             for receiver in data['receivers']:
                 self.remote_nowdes[receiver['mac']] = receiver
+                self.remote_nowdes_last_update[receiver['mac']] = current_time
                 received_macs.add(receiver['mac'])
             
-            # Remove receivers that are no longer in the list
-            macs_to_remove = set(self.remote_nowdes.keys()) - received_macs
-            for mac in macs_to_remove:
-                del self.remote_nowdes[mac]
+            # For devices not in this update, increment their last_seen_ms based on elapsed time
+            for mac in list(self.remote_nowdes.keys()):
+                if mac not in received_macs:
+                    # Calculate time since last update from Nowde
+                    last_update_time = self.remote_nowdes_last_update.get(mac, current_time)
+                    elapsed_ms = int((current_time - last_update_time) * 1000)
+                    
+                    # Update last_seen_ms by adding elapsed time since last Nowde update
+                    # This allows MISSING → GONE → 15min removal transitions
+                    if 'last_seen_ms' in self.remote_nowdes[mac]:
+                        # Keep incrementing from last known value
+                        base_last_seen = self.remote_nowdes[mac].get('_base_last_seen_ms', self.remote_nowdes[mac]['last_seen_ms'])
+                        self.remote_nowdes[mac]['_base_last_seen_ms'] = base_last_seen
+                        self.remote_nowdes[mac]['last_seen_ms'] = base_last_seen + elapsed_ms
             
-            # Update GUI
+            # Update GUI (handles 15-minute removal logic)
             self.update_remote_nowdes_table()
             
             # Log
@@ -614,6 +699,12 @@ class MilluBridge:
         # Clear editing state
         self.editing_layer_mac = None
     
+    def format_device_name(self, full_name):
+        """Format device name for display - keep only part before ':' """
+        if ':' in full_name:
+            return full_name.split(':', 1)[0]
+        return full_name
+    
     def update_remote_nowdes_table(self):
         """Update the Remote Nowdes table in the GUI"""
         if not dpg.does_item_exist("remote_nowdes_table"):
@@ -636,13 +727,23 @@ class MilluBridge:
                 tag = dpg.get_item_alias(child)
                 if tag and tag.startswith("nowde_row_"):
                     mac = tag[10:]  # Remove "nowde_row_" prefix
-                    if mac not in seen_macs:
-                        # Remove stale row (only after 15 min)
-                        last_seen_ms = self.remote_nowdes.get(mac, {}).get('last_seen_ms', 0)
-                        if last_seen_ms > 900000:  # 15 minutes
+                    
+                    # If USB midi sender is disconnected, clear all rows immediately
+                    if len(seen_macs) == 0:
+                        dpg.delete_item(child)
+                        continue
+                    
+                    # For devices in the dict, check if they've been GONE for 15 minutes
+                    if mac in seen_macs:
+                        nowde = self.remote_nowdes[mac]
+                        last_seen_ms = nowde.get('last_seen_ms', 0)
+                        # Remove if GONE (>30s) for more than 15 minutes total (900000ms)
+                        if last_seen_ms > 900000:  # 15 minutes since last seen
                             dpg.delete_item(child)
-                    else:
-                        existing_rows.add(mac)
+                            # Also remove from dict to stop tracking it
+                            del self.remote_nowdes[mac]
+                        else:
+                            existing_rows.add(mac)
         
         # Update or add rows for each remote Nowde, sorted by UUID
         for mac, nowde in sorted(self.remote_nowdes.items(), key=lambda x: x[1].get('uuid', '')):
@@ -988,13 +1089,22 @@ class MilluBridge:
         # Update combo box with available Nowde devices
         if dpg.does_item_exist("nowde_device_combo"):
             if nowde_devices:
-                dpg.configure_item("nowde_device_combo", items=nowde_devices)
+                # Create display names (short) and map them to full names
+                self.nowde_device_map = {}
+                display_names = []
+                for dev in nowde_devices:
+                    display_name = self.format_device_name(dev)
+                    display_names.append(display_name)
+                    self.nowde_device_map[display_name] = dev
+                
+                dpg.configure_item("nowde_device_combo", items=display_names)
                 # If connected device is still in the list, keep it selected
                 if self.current_nowde_device in nowde_devices:
-                    dpg.set_value("nowde_device_combo", self.current_nowde_device)
+                    idx = nowde_devices.index(self.current_nowde_device)
+                    dpg.set_value("nowde_device_combo", display_names[idx])
                 # If no device connected, auto-connect to first available
                 elif not self.current_nowde_device:
-                    dpg.set_value("nowde_device_combo", nowde_devices[0])
+                    dpg.set_value("nowde_device_combo", display_names[0])
                     self.connect_nowde_device(nowde_devices[0])
             else:
                 dpg.configure_item("nowde_device_combo", items=["No Nowde devices found"])
@@ -1015,11 +1125,14 @@ class MilluBridge:
     
     def on_nowde_device_selected(self, sender, app_data):
         """Callback when user selects a Nowde device from dropdown"""
-        selected_device = app_data
+        selected_display_name = app_data
         
         # Ignore placeholder values
-        if selected_device in ["Scanning...", "No Nowde devices found"]:
+        if selected_display_name in ["Scanning...", "No Nowde devices found"]:
             return
+        
+        # Map display name back to full device name
+        selected_device = self.nowde_device_map.get(selected_display_name, selected_display_name)
         
         # If already connected to this device, do nothing
         if self.current_nowde_device == selected_device:
@@ -1030,7 +1143,13 @@ class MilluBridge:
     
     def connect_nowde_device(self, device_name):
         """Connect to a Nowde device"""
-        # Close existing ports
+        # Close existing ports and clear remote nowdes if switching devices
+        if self.current_nowde_device and self.current_nowde_device != device_name:
+            # Switching to a different device - clear remote nowdes table
+            self.remote_nowdes.clear()
+            self.update_remote_nowdes_table()
+            self.update_osc_log(f"Switched from {self.current_nowde_device} to {device_name} - remote table cleared")
+        
         self.output_manager.close_port()
         self.input_manager.close_port()
         
@@ -1045,7 +1164,7 @@ class MilluBridge:
             
             # Update combo box selection
             if dpg.does_item_exist("nowde_device_combo"):
-                dpg.set_value("nowde_device_combo", device_name)
+                dpg.set_value("nowde_device_combo", self.format_device_name(device_name))
             
             self.update_nowde_status(True, device_name)
             self.update_osc_log(f"Nowde connected: {device_name}")
@@ -1072,8 +1191,9 @@ class MilluBridge:
             self.selected_port = None
             self.sender_initialized = False  # Reset initialization flag
             
-            # Clear remote nowdes table
+            # Clear remote nowdes table and tracking
             self.remote_nowdes.clear()
+            self.remote_nowdes_last_update.clear()
             self.update_remote_nowdes_table()
             
             # Update combo box to show no selection
@@ -1096,7 +1216,7 @@ class MilluBridge:
         
         if dpg.does_item_exist("nowde_status_text"):
             if connected and device_name:
-                dpg.set_value("nowde_status_text", f"{device_name}")
+                dpg.set_value("nowde_status_text", f"{self.format_device_name(device_name)}")
                 dpg.configure_item("nowde_status_text", color=(0, 255, 0))
             else:
                 dpg.set_value("nowde_status_text", "Not connected")
@@ -1284,6 +1404,208 @@ class MilluBridge:
         
         # Save config to file
         self.save_config()
+    
+    def upgrade_nowde_firmware(self):
+        """Upgrade Nowde firmware from GitHub"""
+        if not self.current_nowde_device:
+            self.update_osc_log("ERROR: No Nowde connected")
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "No Nowde connected")
+                dpg.configure_item("firmware_upload_status", color=(255, 0, 0))
+            return
+        
+        # Update status
+        if dpg.does_item_exist("firmware_upload_status"):
+            dpg.set_value("firmware_upload_status", "Fetching firmware from GitHub...")
+            dpg.configure_item("firmware_upload_status", color=(255, 255, 0))
+        if dpg.does_item_exist("firmware_upload_progress"):
+            dpg.configure_item("firmware_upload_progress", show=True)
+            dpg.set_value("firmware_upload_progress", 0.0)
+        
+        self.update_osc_log("Starting firmware upgrade...")
+        
+        # Run in background thread to not block GUI
+        thread = threading.Thread(target=self._upgrade_firmware_thread, daemon=True)
+        thread.start()
+    
+    def _upgrade_firmware_thread(self):
+        """Background thread for firmware upgrade"""
+        firmware_file = None
+        try:
+            # Step 1: Download firmware from GitHub
+            self.update_osc_log("Downloading firmware from GitHub...")
+            firmware_url = "https://raw.githubusercontent.com/Hemisphere-Project/MilluBridge/main/Nowde/bin/firmware.bin"
+            
+            # Create temp file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.bin')
+            firmware_file = temp_file.name
+            temp_file.close()
+            
+            # Download with timeout
+            response = requests.get(firmware_url, timeout=30)
+            response.raise_for_status()
+            
+            with open(firmware_file, 'wb') as f:
+                f.write(response.content)
+            
+            firmware_size = len(response.content)
+            self.update_osc_log(f"✅ Downloaded firmware ({firmware_size} bytes)")
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.set_value("firmware_upload_progress", 0.1)
+            
+            # Step 2: Send Enter Bootloader command
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Entering bootloader mode...")
+            
+            self.update_osc_log("Sending Enter Bootloader command...")
+            result = self.output_manager.send_enter_bootloader()
+            
+            if not result or not result[0]:
+                raise Exception("Failed to send bootloader command")
+            
+            # Step 3: Close MIDI ports (device will disconnect)
+            self.output_manager.close_port()
+            self.input_manager.close_port()
+            
+            # Step 4: Wait for device to reboot into bootloader
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Waiting for bootloader...")
+            
+            self.update_osc_log("Waiting for bootloader...")
+            time.sleep(3)  # Give device time to reboot
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.set_value("firmware_upload_progress", 0.2)
+            
+            # Step 5: Find USB serial port
+            serial_port = self._find_esp32_serial_port()
+            if not serial_port:
+                raise Exception("Could not find ESP32 bootloader port. Try manually resetting the device.")
+            
+            self.update_osc_log(f"Found bootloader on: {serial_port}")
+            
+            # Step 6: Flash firmware using esptool
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Flashing firmware...")
+            
+            self._flash_firmware(serial_port, firmware_file)
+            
+            # Step 7: Success!
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "✅ Upgrade complete! Device rebooting...")
+                dpg.configure_item("firmware_upload_status", color=(0, 255, 0))
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.set_value("firmware_upload_progress", 1.0)
+            
+            self.update_osc_log("✅ Firmware upgrade successful!")
+            
+            # Step 8: Wait for device to reboot and reconnect
+            time.sleep(4)
+            self.refresh_midi_devices()
+            
+            # Hide progress bar after a delay
+            time.sleep(2)
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.configure_item("firmware_upload_progress", show=False)
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to download firmware from GitHub: {str(e)}"
+            self.update_osc_log(f"❌ {error_msg}")
+            
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", "Download failed - check network")
+                dpg.configure_item("firmware_upload_status", color=(255, 0, 0))
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.configure_item("firmware_upload_progress", show=False)
+            
+        except Exception as e:
+            error_msg = f"Firmware upgrade failed: {str(e)}"
+            self.update_osc_log(f"❌ {error_msg}")
+            
+            if dpg.does_item_exist("firmware_upload_status"):
+                dpg.set_value("firmware_upload_status", str(e))
+                dpg.configure_item("firmware_upload_status", color=(255, 0, 0))
+            
+            if dpg.does_item_exist("firmware_upload_progress"):
+                dpg.configure_item("firmware_upload_progress", show=False)
+            
+            # Try to reconnect to MIDI anyway
+            time.sleep(1)
+            self.refresh_midi_devices()
+        
+        finally:
+            # Clean up temp file
+            if firmware_file and os.path.exists(firmware_file):
+                try:
+                    os.unlink(firmware_file)
+                except:
+                    pass
+    
+    def _find_esp32_serial_port(self):
+        """Find ESP32 bootloader serial port"""
+        # Platform-specific patterns
+        if os.uname().sysname == 'Darwin':  # macOS
+            patterns = ['/dev/cu.usbmodem*', '/dev/tty.usbmodem*']
+        elif os.name == 'posix':  # Linux
+            patterns = ['/dev/ttyACM*', '/dev/ttyUSB*']
+        else:  # Windows
+            patterns = ['COM*']
+        
+        for pattern in patterns:
+            ports = glob.glob(pattern)
+            if ports:
+                return ports[0]  # Return first match
+        
+        return None
+    
+    def _flash_firmware(self, port, firmware_file):
+        """Flash firmware using esptool"""
+        # esptool.py command for ESP32-S3
+        cmd = [
+            'python3', '-m', 'esptool',
+            '--chip', 'esp32s3',
+            '--port', port,
+            '--baud', '921600',  # Fast baud rate
+            'write_flash',
+            '0x0', firmware_file  # Flash at address 0x0
+        ]
+        
+        # Run esptool with progress output
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True
+        )
+        
+        # Parse output for progress
+        for line in process.stdout:
+            line = line.strip()
+            
+            # Update log (but skip repetitive lines)
+            if line and not line.startswith("Writing at"):
+                self.update_osc_log(f"  {line}")
+            
+            # Parse progress (esptool outputs "Writing at 0x00008000... (50 %)")
+            if "Writing at" in line and "%" in line:
+                try:
+                    percent_str = line.split("(")[1].split("%")[0].strip()
+                    percent = float(percent_str) / 100.0
+                    # Map to 0.2-1.0 range (0-0.2 was download/prep)
+                    progress = 0.2 + (percent * 0.8)
+                    
+                    if dpg.does_item_exist("firmware_upload_progress"):
+                        dpg.set_value("firmware_upload_progress", progress)
+                except:
+                    pass
+        
+        # Check result
+        return_code = process.wait()
+        if return_code != 0:
+            raise Exception(f"esptool failed with code {return_code}")
     
     def on_osc_settings_changed(self, sender, app_data):
         """Callback when OSC settings are changed"""
