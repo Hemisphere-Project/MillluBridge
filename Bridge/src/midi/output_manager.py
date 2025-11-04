@@ -160,11 +160,16 @@ class OutputManager:
         return (True, self.format_sysex_message(message))
     
     def send_change_receiver_layer(self, mac_address, layer_name):
-        """Send 'Change Receiver Layer' SysEx message to update a specific receiver's layer"""
+        """Send 'Change Receiver Layer' SysEx message to update a specific receiver's layer
+        
+        Format (7-bit encoded):
+        F0 7D 11 [mac_encoded(7 bytes)] [layer_encoded(19 bytes)] F7
+        MAC: 6 bytes -> 7 bytes encoded
+        Layer: 16 bytes -> 19 bytes encoded (2 chunks: 7+7+2 bytes)
+        """
         if not self.current_port:
             return False
         
-        # F0 7D 04 [mac(6 bytes)] [layer_name(16 bytes)] F7
         # Convert MAC string (e.g., "AA:BB:CC:DD:EE:FF") to 6 bytes
         mac_parts = mac_address.split(':')
         if len(mac_parts) != 6:
@@ -178,11 +183,17 @@ class OutputManager:
             return False
         
         # Pad or truncate layer name to exactly 16 bytes
-        layer_bytes = (layer_name[:16] + '\x00' * 16)[:16].encode('ascii')
+        layer_bytes = list((layer_name[:16] + '\x00' * 16)[:16].encode('ascii'))
+        
+        # 7-bit encode MAC (6 bytes -> 7 bytes encoded)
+        mac_encoded = self.encode_7bit(mac_bytes)
+        
+        # 7-bit encode layer name (16 bytes -> 19 bytes encoded)
+        layer_encoded = self.encode_7bit(layer_bytes)
         
         message = ([self.SYSEX_START, self.SYSEX_MANUFACTURER_ID, 
                    self.SYSEX_CMD_CHANGE_RECEIVER_LAYER] + 
-                   mac_bytes + list(layer_bytes) + [self.SYSEX_END])
+                   mac_encoded + layer_encoded + [self.SYSEX_END])
         
         self.midi_out.send_message(message)
         print(f"Sent Change Receiver Layer SysEx: MAC={mac_address}, Layer={layer_name}")
