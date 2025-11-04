@@ -176,6 +176,7 @@ class MilluBridge:
         # Remote Nowdes tracking
         self.remote_nowdes = {}  # {mac: {name, version, layer}}
         self.remote_nowdes_last_update = {}  # {mac: timestamp} - track when we last received update from Nowde
+        self.running_state_session = None  # Aggregate chunked RUNNING_STATE responses
         
         # Layer editing modal state
         self.editing_layer_mac = None  # Track which device is being edited
@@ -433,6 +434,33 @@ class MilluBridge:
             
             dpg.add_separator()
             
+            # Nowde Logs section (hidden by default)
+            with dpg.group(tag="nowde_logs_section", show=False):
+                dpg.add_separator()
+                
+                dpg.add_text("Nowde Logs", color=(150, 200, 255))
+                
+                # Use child window for auto-scrolling log
+                with dpg.child_window(tag="midi_log_window", width=-1, height=150, border=True):
+                    dpg.add_text("Waiting for Nowde messages...", tag="midi_log_text", wrap=850)
+            
+            dpg.add_separator()
+            
+            # Remote Nowdes section
+            dpg.add_text("Remote Nowdes", color=(150, 200, 255))
+            with dpg.table(header_row=True, tag="remote_nowdes_table", 
+                          borders_innerH=True, borders_outerH=True, 
+                          borders_innerV=True, borders_outerV=True,
+                          row_background=True, resizable=True, height=150):
+                dpg.add_table_column(label="Nowde", width_fixed=True, init_width_or_weight=100)
+                dpg.add_table_column(label="Version", width_fixed=True, init_width_or_weight=80)
+                dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=80)
+                dpg.add_table_column(label="Index", width_fixed=True, init_width_or_weight=60)
+                dpg.add_table_column(label="Layer", width_fixed=True, init_width_or_weight=150)
+                dpg.add_table_column(label="Simulate", width_fixed=True, init_width_or_weight=100)
+            
+            dpg.add_separator()
+            
             # Simulation Clock control
             dpg.add_text("Media Simulation", color=(150, 200, 255))
             with dpg.group(horizontal=True):
@@ -461,31 +489,6 @@ class MilluBridge:
                                  min_value=1, max_value=1000, width=150,
                                  callback=self.on_rf_sim_max_delay_changed)
                 dpg.add_text("ms")
-            
-            # Nowde Logs section (hidden by default)
-            with dpg.group(tag="nowde_logs_section", show=False):
-                dpg.add_separator()
-                
-                dpg.add_text("Nowde Logs", color=(150, 200, 255))
-                
-                # Use child window for auto-scrolling log
-                with dpg.child_window(tag="midi_log_window", width=-1, height=150, border=True):
-                    dpg.add_text("Waiting for Nowde messages...", tag="midi_log_text", wrap=850)
-            
-            dpg.add_separator()
-            
-            # Remote Nowdes section
-            dpg.add_text("Remote Nowdes", color=(150, 200, 255))
-            with dpg.table(header_row=True, tag="remote_nowdes_table", 
-                          borders_innerH=True, borders_outerH=True, 
-                          borders_innerV=True, borders_outerV=True,
-                          row_background=True, resizable=True, height=150):
-                dpg.add_table_column(label="Nowde", width_fixed=True, init_width_or_weight=100)
-                dpg.add_table_column(label="Version", width_fixed=True, init_width_or_weight=80)
-                dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=80)
-                dpg.add_table_column(label="Index", width_fixed=True, init_width_or_weight=60)
-                dpg.add_table_column(label="Layer", width_fixed=True, init_width_or_weight=150)
-                dpg.add_table_column(label="Simulate", width_fixed=True, init_width_or_weight=100)
 
     def handle_sysex_message(self, msg_type, data):
         """Handle parsed SysEx messages from Nowde"""
@@ -547,38 +550,57 @@ class MilluBridge:
             self.update_osc_log(f"Config received from sender: RF Sim={'ON' if data['rf_simulation_enabled'] else 'OFF'}")
         
         elif msg_type == 'running_state':
-            # Incrementally update remote Nowdes table from receiver list
-            # Keep devices even if not in latest message (15-min retention in UI logic)
             import time
             current_time = time.time()
-            received_macs = set()
-            
-            for receiver in data['receivers']:
-                self.remote_nowdes[receiver['mac']] = receiver
-                self.remote_nowdes_last_update[receiver['mac']] = current_time
-                received_macs.add(receiver['mac'])
-            
-            # For devices not in this update, increment their last_seen_ms based on elapsed time
-            for mac in list(self.remote_nowdes.keys()):
-                if mac not in received_macs:
-                    # Calculate time since last update from Nowde
-                    last_update_time = self.remote_nowdes_last_update.get(mac, current_time)
-                    elapsed_ms = int((current_time - last_update_time) * 1000)
-                    
-                    # Update last_seen_ms by adding elapsed time since last Nowde update
-                    # This allows MISSING → GONE → 15min removal transitions
-                    if 'last_seen_ms' in self.remote_nowdes[mac]:
-                        # Keep incrementing from last known value
-                        base_last_seen = self.remote_nowdes[mac].get('_base_last_seen_ms', self.remote_nowdes[mac]['last_seen_ms'])
-                        self.remote_nowdes[mac]['_base_last_seen_ms'] = base_last_seen
-                        self.remote_nowdes[mac]['last_seen_ms'] = base_last_seen + elapsed_ms
-            
-            # Update GUI (handles 15-minute removal logic)
-            self.update_remote_nowdes_table()
-            
-            # Log
-            mesh_status = "SYNCED" if data['mesh_synced'] else "NOT SYNCED"
-            self.update_osc_log(f"Running state: Uptime {data['uptime_s']:.1f}s, Mesh {mesh_status}, {len(data['receivers'])} receiver(s)")
+
+            total_receivers = data.get('total_receivers', len(data['receivers']))
+            chunk_index = data.get('chunk_index', 0)
+            chunk_count = max(1, data.get('chunk_count', 1))
+            chunk_payload = data.get('chunk_receiver_count', len(data['receivers']))
+
+            session = self.running_state_session
+            reset_session = False
+
+            if session is None:
+                reset_session = True
+            else:
+                timed_out = (current_time - session.get('timestamp', 0)) > 5.0
+                mismatched = session.get('chunk_count') != chunk_count or session.get('total_receivers') != total_receivers
+                if chunk_index == 0 or timed_out or mismatched:
+                    reset_session = True
+
+            if reset_session:
+                session = {
+                    'timestamp': current_time,
+                    'chunk_count': chunk_count,
+                    'total_receivers': total_receivers,
+                    'received_chunks': set(),
+                    'chunks': {}
+                }
+                self.running_state_session = session
+
+            if chunk_index >= chunk_count:
+                clamped_index = max(0, chunk_count - 1)
+                print(f"[DEBUG] RUNNING_STATE: chunk index {chunk_index} out of range, clamping to {clamped_index}")
+                chunk_index = clamped_index
+
+            session['timestamp'] = current_time
+            session['received_chunks'].add(chunk_index)
+            session['chunks'][chunk_index] = data['receivers']
+
+            if len(session['received_chunks']) == session['chunk_count']:
+                receivers = []
+                for idx in range(session['chunk_count']):
+                    receivers.extend(session['chunks'].get(idx, []))
+
+                self._apply_running_state_receivers(
+                    receivers,
+                    current_time,
+                    data.get('mesh_synced', False),
+                    data.get('uptime_s', 0.0),
+                    total_receivers
+                )
+                self.running_state_session = None
         
         elif msg_type == 'error_report':
             # Log error from Nowde
@@ -592,6 +614,53 @@ class MilluBridge:
             # Log received SysEx in human-readable format
             self.log_nowde_message(f"RX: {data}")
     
+    def _apply_running_state_receivers(self, receivers, current_time, mesh_synced, uptime_s, total_receivers):
+        """Apply a fully aggregated RUNNING_STATE update to the remote Nowde table."""
+        received_macs = set()
+        receiver_count = len(receivers)
+
+        # Only log detailed receiver info if count changed
+        if receiver_count != len(self.remote_nowdes):
+            print(
+                f"\n[DEBUG] RUNNING_STATE: {receiver_count} receivers from Nowde"
+                + (f" (expected {total_receivers})" if receiver_count != total_receivers else "")
+            )
+            for idx, receiver in enumerate(receivers):
+                print(
+                    f"  [{idx}] MAC: {receiver['mac']}, Layer: '{receiver['layer']}', "
+                    f"Version: {receiver['version']}, LastSeen: {receiver['last_seen_ms']}ms, "
+                    f"Active: {receiver['active']}, MediaIdx: {receiver['media_index']}"
+                )
+
+        for receiver in receivers:
+            self.remote_nowdes[receiver['mac']] = receiver
+            self.remote_nowdes_last_update[receiver['mac']] = current_time
+            received_macs.add(receiver['mac'])
+
+        # For devices not present in this update, increment their last_seen_ms so UI ageing works
+        for mac in list(self.remote_nowdes.keys()):
+            if mac not in received_macs:
+                # Store the base time when device first went missing (don't overwrite if already set)
+                if '_base_last_seen_ms' not in self.remote_nowdes[mac]:
+                    self.remote_nowdes[mac]['_base_last_seen_ms'] = self.remote_nowdes[mac].get('last_seen_ms', 0)
+                    self.remote_nowdes[mac]['_missing_since'] = current_time
+                
+                # Calculate elapsed time since device first went missing
+                missing_since = self.remote_nowdes[mac].get('_missing_since', current_time)
+                elapsed_ms = int((current_time - missing_since) * 1000)
+                
+                # Update last_seen_ms = base + elapsed
+                base_last_seen = self.remote_nowdes[mac]['_base_last_seen_ms']
+                self.remote_nowdes[mac]['last_seen_ms'] = base_last_seen + elapsed_ms
+
+        # Update GUI (handles 15-minute removal logic)
+        self.update_remote_nowdes_table()
+
+        mesh_status = "SYNCED" if mesh_synced else "NOT SYNCED"
+        self.update_osc_log(
+            f"Running state: Uptime {uptime_s:.1f}s, Mesh {mesh_status}, {total_receivers} receiver(s)"
+        )
+
     def on_layer_changed(self, mac_address, new_layer):
         """Handle layer change from GUI"""
         if not self.current_nowde_device:
@@ -736,7 +805,7 @@ class MilluBridge:
                     if mac in seen_macs:
                         nowde = self.remote_nowdes[mac]
                         last_seen_ms = nowde.get('last_seen_ms', 0)
-                        # Remove if GONE (>30s) for more than 15 minutes total (900000ms)
+                        # Remove if GONE (>10s) for more than 15 minutes total (900000ms)
                         if last_seen_ms > 900000:  # 15 minutes since last seen
                             dpg.delete_item(child)
                             # Also remove from dict to stop tracking it
@@ -755,11 +824,11 @@ class MilluBridge:
                 state_text = "ACTIVE"
                 state_color = (0, 255, 0)  # Green
                 text_color = (255, 255, 255)
-            elif last_seen_ms < 30000:  # 3s-30s = MISSING
+            elif last_seen_ms < 10000:  # 3s-10s = MISSING (matches ESP32 removal timeout)
                 state_text = "MISSING"
                 state_color = (255, 255, 0)  # Yellow
                 text_color = (200, 200, 150)
-            else:  # > 30s = GONE
+            else:  # > 10s = GONE
                 state_text = "GONE"
                 state_color = (255, 0, 0)  # Red
                 text_color = (150, 80, 80)
@@ -816,6 +885,10 @@ class MilluBridge:
                         callback=lambda s, a, u: self.on_simulation_mode_changed(u['mac'], a),
                         user_data={'mac': mac}
                     )
+        
+        # Auto-manage simulation clock based on current remote states
+        # (e.g., if all simulating devices disconnected, stop the clock)
+        self._auto_manage_simulation_clock()
     
     def handle_osc_message(self, message):
         self.last_osc_time = time.time()
@@ -863,7 +936,8 @@ class MilluBridge:
             
             # Check if this layer is being simulated - if so, discard real messages
             if self.is_layer_in_simulation(layer_name):
-                return False
+                # Silently ignore real OSC for simulated layers
+                return True  # Return True to indicate message was "handled" (by ignoring it)
             
             # Parse arguments - remove parentheses and split by comma
             args_str = args_str.strip().strip("()")
@@ -979,8 +1053,12 @@ class MilluBridge:
         if not dpg.does_item_exist("layers_table"):
             return
         
-        # Update or add rows for each layer
+        # Update or add rows for each layer (skip layers in simulation mode)
         for layer_name, layer_data in sorted(self.layers.items()):
+            # Skip layers that are being simulated
+            if self.is_layer_in_simulation(layer_name):
+                continue
+            
             row_tag = f"layer_row_{layer_name}"
             
             if layer_name not in self.layer_rows:
@@ -1255,7 +1333,7 @@ class MilluBridge:
                     )
     
     def start_running_state_thread(self):
-        """Start background thread to query running state every second"""
+        """Start background thread to query running state periodically"""
         self.stop_running_state = False
         
         def running_state_loop():
@@ -1264,7 +1342,7 @@ class MilluBridge:
                     # Query running state only if sender is initialized (received HELLO)
                     if self.current_nowde_device and self.output_manager.current_port and self.sender_initialized:
                         self.output_manager.send_query_running_state()
-                    time.sleep(1.0)  # 1Hz query rate
+                    time.sleep(2.0)  # 0.5Hz query rate to reduce large SysEx bursts
                 except Exception as e:
                     print(f"Error in running state thread: {e}")
                     time.sleep(1)
@@ -1658,6 +1736,28 @@ class MilluBridge:
         """Callback when simulation mode is changed for a Remote Nowde"""
         self.simulation_settings['mac'][mac] = mode
         self.update_osc_log(f"Simulation for {self.remote_nowdes.get(mac, {}).get('uuid', mac)}: {mode}")
+        
+        # Auto-start/stop simulation clock based on whether any remote needs it
+        self._auto_manage_simulation_clock()
+    
+    def _auto_manage_simulation_clock(self):
+        """Automatically start/stop simulation clock based on remote Nowde simulation states"""
+        # Check if any remote Nowde has simulation enabled (not "Disabled")
+        any_simulation_active = False
+        for mac in self.remote_nowdes.keys():
+            sim_mode = self.simulation_settings['mac'].get(mac, 'Disabled')
+            if sim_mode != 'Disabled':
+                any_simulation_active = True
+                break
+        
+        # Start clock if needed and not running
+        if any_simulation_active and not self.simulation_clock_running:
+            self.update_osc_log("Auto-starting simulation clock (remote simulation enabled)")
+            self.toggle_simulation_clock()
+        # Stop clock if not needed and running
+        elif not any_simulation_active and self.simulation_clock_running:
+            self.update_osc_log("Auto-stopping simulation clock (no remote simulations)")
+            self.toggle_simulation_clock()
     
     def on_sim_clock_duration_changed(self, sender, app_data):
         """Callback when simulation clock duration is changed"""
@@ -1718,6 +1818,10 @@ class MilluBridge:
                 position_ms = int(self.simulation_clock_position * 1000)
                 
                 for mac, nowde in self.remote_nowdes.items():
+                    # Skip disconnected/missing devices
+                    if nowde.get('last_seen_ms', 99999) > 10000:
+                        continue
+                    
                     sim_mode = self.simulation_settings['mac'].get(mac, 'Disabled')
                     
                     if sim_mode == 'Disabled':
@@ -1739,7 +1843,7 @@ class MilluBridge:
                         except ValueError:
                             continue
                     
-                    # Send media sync
+                    # Send media sync (simulation takes priority over real OSC for this layer)
                     self.output_manager.send_media_sync(
                         layer_name=layer_name,
                         media_index=media_index,

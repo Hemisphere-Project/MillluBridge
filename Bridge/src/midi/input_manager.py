@@ -24,6 +24,14 @@ class InputManager:
         # Enable SysEx messages (don't ignore them)
         self.midi_in.ignore_types(sysex=False)
         
+        # Set larger buffer size for big SysEx messages (default is usually 1024)
+        # RUNNING_STATE with 8 receivers is ~347 bytes
+        try:
+            self.midi_in.set_buffer_size(4096)
+            print("MIDI input buffer size set to 4096 bytes")
+        except:
+            print("Warning: Could not set MIDI buffer size")
+        
         self.current_port = None
         self.callback = callback
         self.sysex_callback = sysex_callback
@@ -243,12 +251,12 @@ class InputManager:
         return config, formatted
     
     def _parse_running_state(self, sysex_data):
-        """Parse RUNNING_STATE SysEx message
-        Format: F0 7D 22 [uptime(4,encoded:5)] [meshSynced(1)] [numReceivers(1)] 
-                [receiver1_data(36,encoded:42)...] F7
-        All multi-byte fields are 7-bit encoded
-        """
-        if len(sysex_data) < 11:  # Minimum: F0 7D 21 + 5 uptime(encoded) + 1 sync + 1 count + F7
+        """Parse RUNNING_STATE SysEx message sent in chunks.
+        Format: F0 7D 22 [uptime(4,encoded:5)] [meshSynced(1)] [totalReceivers(1)]
+                [chunkIndex(1)] [chunkCount(1)] [chunkReceiverCount(1)]
+                [receiver_data_chunk...] F7
+        Each receiver block is 36 bytes raw (42 bytes encoded)."""
+        if len(sysex_data) < 14:
             return None, "SysEx: RUNNING_STATE (invalid format)"
         
         idx = 3  # Start after F0 7D 21
@@ -269,16 +277,31 @@ class InputManager:
         mesh_synced = sysex_data[idx] != 0
         idx += 1
         
-        # Parse receiver count (1 byte, safe as-is)
+        # Total receivers across all chunks
         if idx >= len(sysex_data) - 1:
-            return None, "SysEx: RUNNING_STATE (truncated at num_receivers)"
-        num_receivers = sysex_data[idx]
+            return None, "SysEx: RUNNING_STATE (truncated at total_receivers)"
+        total_receivers = sysex_data[idx]
+        idx += 1
+
+        if idx >= len(sysex_data) - 1:
+            return None, "SysEx: RUNNING_STATE (truncated at chunk_index)"
+        chunk_index = sysex_data[idx]
+        idx += 1
+
+        if idx >= len(sysex_data) - 1:
+            return None, "SysEx: RUNNING_STATE (truncated at chunk_count)"
+        chunk_count = max(1, sysex_data[idx])
+        idx += 1
+
+        if idx >= len(sysex_data) - 1:
+            return None, "SysEx: RUNNING_STATE (truncated at chunk_receiver_count)"
+        chunk_receiver_count = sysex_data[idx]
         idx += 1
         
         receivers = []
         
         # Parse each receiver (42 bytes encoded -> 36 bytes decoded)
-        for i in range(num_receivers):
+        for _ in range(chunk_receiver_count):
             if idx + 42 > len(sysex_data) - 1:  # -1 for SYSEX_END
                 break
             
@@ -330,10 +353,16 @@ class InputManager:
             'uptime_ms': uptime_ms,
             'uptime_s': uptime_s,
             'mesh_synced': mesh_synced,
+            'total_receivers': total_receivers,
+            'chunk_index': chunk_index,
+            'chunk_count': chunk_count,
+            'chunk_receiver_count': chunk_receiver_count,
             'receivers': receivers
         }
         
-        formatted = f"SysEx: RUNNING_STATE - Uptime: {uptime_s:.1f}s, Mesh: {'SYNCED' if mesh_synced else 'NOT SYNCED'}, Receivers: {num_receivers}"
+        formatted = (f"SysEx: RUNNING_STATE - Uptime: {uptime_s:.1f}s, Mesh: {'SYNCED' if mesh_synced else 'NOT SYNCED'}, "
+                     f"Total: {total_receivers}, Chunk: {chunk_index + 1}/{chunk_count}, "
+                     f"Payload: {chunk_receiver_count}")
         if receivers:
             receivers_str = ', '.join([f"{r['uuid']} v{r['version']}({r['layer']})" for r in receivers])
             formatted += f" [{receivers_str}]"
