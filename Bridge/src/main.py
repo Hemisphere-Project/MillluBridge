@@ -1618,22 +1618,32 @@ class MilluBridge:
             
             self.update_osc_log("✅ Firmware update successful! Device rebooting...")
             
-            # Close MIDI ports to allow device to reconnect
-            time.sleep(1)
+            # Fully disconnect and close all MIDI connections before reboot
+            self.update_osc_log("Closing MIDI connections...")
+            
+            # Disconnect device (clears state and closes ports)
+            if self.current_nowde_device:
+                self.disconnect_nowde_device()
+            
+            # Ensure all MIDI ports are fully closed
             self.output_manager.close_port()
             self.input_manager.close_port()
             
             # Wait longer for device to fully reboot and re-enumerate USB
             # ESP32 needs time to: validate firmware, switch partitions, reboot, and reconnect
-            self.update_osc_log("Waiting for device to reboot and reconnect...")
+            self.update_osc_log("Waiting for device to reboot and re-enumerate USB...")
             time.sleep(8)  # 8 seconds for full reboot cycle
             
             if dpg.does_item_exist("firmware_upload_progress"):
                 dpg.set_value("firmware_upload_progress", 1.0)
             
             # Refresh MIDI devices to detect reconnected device
+            # This will auto-connect and start listening for HELLO message
             self.update_osc_log("Scanning for reconnected device...")
             self.refresh_midi_devices()
+            
+            # HELLO message will arrive asynchronously and update version display
+            self.update_osc_log("✅ Firmware update complete - waiting for device HELLO...")
             
             # Hide progress bar and status after a delay
             time.sleep(2)
