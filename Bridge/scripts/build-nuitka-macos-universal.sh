@@ -12,7 +12,12 @@ SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}/.."
 cd "${PROJECT_ROOT}"
 
+MACOS_MIN_VERSION_X64="${MACOS_MIN_VERSION_X64:-10.15}"
+MACOS_MIN_VERSION_ARM="${MACOS_MIN_VERSION_ARM:-11.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN_VERSION_X64}"
+
 echo "🏗️  Building MilluBridge (universal2) with Nuitka..."
+echo "🎯 Targeting macOS ${MACOS_MIN_VERSION_X64}+ on x86_64 and ${MACOS_MIN_VERSION_ARM}+ on arm64"
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -74,6 +79,28 @@ if [ -d "dist/main.app" ]; then
     rm -rf "${UNIVERSAL_APP}"
     mv "dist/main.app" "${UNIVERSAL_APP}"
     echo -e "${GREEN}✅ Build successful: ${UNIVERSAL_APP}${NC}"
+
+    PLIST_PATH="${UNIVERSAL_APP}/Contents/Info.plist"
+    if [ -f "${PLIST_PATH}" ]; then
+        if /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "${PLIST_PATH}" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${MACOS_MIN_VERSION_X64}" "${PLIST_PATH}" >/dev/null
+        else
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${MACOS_MIN_VERSION_X64}" "${PLIST_PATH}" >/dev/null
+        fi
+
+        if /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersionByArchitecture" "${PLIST_PATH}" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersionByArchitecture:x86_64 ${MACOS_MIN_VERSION_X64}" "${PLIST_PATH}" >/dev/null
+            /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersionByArchitecture:arm64 ${MACOS_MIN_VERSION_ARM}" "${PLIST_PATH}" >/dev/null
+        else
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture dict" "${PLIST_PATH}" >/dev/null
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:x86_64 string ${MACOS_MIN_VERSION_X64}" "${PLIST_PATH}" >/dev/null
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:arm64 string ${MACOS_MIN_VERSION_ARM}" "${PLIST_PATH}" >/dev/null
+        fi
+
+        echo -e "${GREEN}✅ Minimum macOS versions stamped (x86_64=${MACOS_MIN_VERSION_X64}, arm64=${MACOS_MIN_VERSION_ARM})${NC}"
+    else
+        echo "⚠️ Couldn't find Info.plist to stamp LSMinimumSystemVersion"
+    fi
 else
     echo "❌ Build failed - .app bundle not found"
     exit 1

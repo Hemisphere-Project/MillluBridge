@@ -12,6 +12,9 @@ SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}/.."
 cd "${PROJECT_ROOT}"
 
+MACOS_MIN_VERSION="${MACOS_MIN_VERSION:-10.15}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN_VERSION}"
+
 ARCH_BIN="arch"
 if ! command -v "${ARCH_BIN}" >/dev/null 2>&1 || ! ${ARCH_BIN} -x86_64 /usr/bin/true >/dev/null 2>&1; then
     echo "❌ Rosetta (arch -x86_64) is required. Install with: softwareupdate --install-rosetta"
@@ -46,6 +49,7 @@ EOF
 fi
 
 echo "🏗️  Building MilluBridge (x86_64) with Nuitka..."
+echo "🎯 Targeting macOS ${MACOSX_DEPLOYMENT_TARGET}+ runtimes"
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -116,6 +120,26 @@ if [ -d "dist/main.app" ]; then
     rm -rf "${X64_APP}"
     mv "dist/main.app" "${X64_APP}"
     echo -e "${GREEN}✅ Build successful: ${X64_APP}${NC}"
+
+    PLIST_PATH="${X64_APP}/Contents/Info.plist"
+    if [ -f "${PLIST_PATH}" ]; then
+        if /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "${PLIST_PATH}" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${MACOSX_DEPLOYMENT_TARGET}" "${PLIST_PATH}" >/dev/null
+        else
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${MACOSX_DEPLOYMENT_TARGET}" "${PLIST_PATH}" >/dev/null
+        fi
+
+        if /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersionByArchitecture" "${PLIST_PATH}" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersionByArchitecture:x86_64 ${MACOSX_DEPLOYMENT_TARGET}" "${PLIST_PATH}" >/dev/null
+        else
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture dict" "${PLIST_PATH}" >/dev/null
+            /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:x86_64 string ${MACOSX_DEPLOYMENT_TARGET}" "${PLIST_PATH}" >/dev/null
+        fi
+
+        echo -e "${GREEN}✅ Minimum macOS version set to ${MACOSX_DEPLOYMENT_TARGET}${NC}"
+    else
+        echo "⚠️ Couldn't find Info.plist to stamp LSMinimumSystemVersion"
+    fi
 else
     echo "❌ Build failed - .app bundle not found"
     exit 1
