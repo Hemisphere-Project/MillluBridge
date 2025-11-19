@@ -55,15 +55,21 @@ if [[ "$PLATFORM" == "macos" ]]; then
         MACOS_TARGET_ARCH="x86_64"
     fi
 
-    export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN_VERSION}"
-    echo -e "${BLUE}Targeting macOS ${MACOSX_DEPLOYMENT_TARGET}+${NC}"
-
-    MIN_VERSION_FLAG="-mmacosx-version-min=${MACOS_MIN_VERSION}"
-    export CFLAGS="${MIN_VERSION_FLAG} ${CFLAGS:-}"
-    export CXXFLAGS="${MIN_VERSION_FLAG} ${CXXFLAGS:-}"
-    export LDFLAGS="${MIN_VERSION_FLAG} ${LDFLAGS:-}"
+    # Note: Not setting MACOSX_DEPLOYMENT_TARGET or compiler flags to avoid runtime crashes
+    # Let Nuitka and system defaults handle this
+    echo -e "${BLUE}Building for macOS (architecture: ${ARCHITECTURE})${NC}"
 else
     BUILD_SUFFIX="-linux"
+fi
+
+# Check Python version and warn if using 3.14 (known issues with Nuitka on macOS)
+if [[ "$PLATFORM" == "macos" ]]; then
+    PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
+    if [[ "$PYTHON_VERSION" == 3.14* ]]; then
+        echo -e "${BLUE}⚠️  Warning: Python 3.14 detected. Nuitka may have compatibility issues.${NC}"
+        echo -e "${BLUE}   Consider downgrading to Python 3.12 if build fails:${NC}"
+        echo -e "${BLUE}   brew unlink python && brew install python@3.12 && brew link python@3.12${NC}"
+    fi
 fi
 
 # Install build dependencies (pin uv to an interpreter that matches host architecture unless overridden)
@@ -164,6 +170,7 @@ if [[ "$PLATFORM" == "macos" ]]; then
         fi
     fi
 
+    # Use verbose mode to diagnose issues
     uv run python -m nuitka \
         --standalone \
         --macos-create-app-bundle \
@@ -172,6 +179,8 @@ if [[ "$PLATFORM" == "macos" ]]; then
         --enable-plugin=no-qt \
         --assume-yes-for-downloads \
         --disable-console \
+        --show-progress \
+        --show-memory \
         ${TARGET_ARCH_FLAG} \
         ${PYTHON_FOR_SCONS_FLAG} \
         $ICON_FLAG \
@@ -183,26 +192,17 @@ if [[ "$PLATFORM" == "macos" ]]; then
         rm -rf "${APP_BUNDLE_PATH}"
         mv "dist/main.app" "${APP_BUNDLE_PATH}"
 
-        PLIST_PATH="${APP_BUNDLE_PATH}/Contents/Info.plist"
-        if [ -f "${PLIST_PATH}" ]; then
-            if ! /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null 2>&1; then
-                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null
-            fi
-
-            if ! /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersionByArchitecture" "${PLIST_PATH}" >/dev/null 2>&1; then
-                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture dict" "${PLIST_PATH}" >/dev/null
-            fi
-
-            if ! /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersionByArchitecture:${ARCHITECTURE} ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null 2>&1; then
-                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:${ARCHITECTURE} string ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null
-            fi
-
-            echo -e "${GREEN}✅ Minimum macOS version set to ${MACOS_MIN_VERSION}${NC}"
-        else
-            echo "⚠️ Unable to find Info.plist for stamping minimum macOS version"
-        fi
+        # Skip strict version enforcement to avoid runtime incompatibilities
+        echo -e "${BLUE}Bundle created without strict version requirements${NC}"
 
         FINAL_TARGET="${APP_BUNDLE_PATH}"
+        
+        # Ad-hoc codesign the bundle to fix entitlements (prevents SIGBUS crashes)
+        echo -e "${BLUE}Signing application bundle...${NC}"
+        codesign --deep --force --sign - "${FINAL_TARGET}" 2>/dev/null || {
+            echo -e "${BLUE}⚠️  Warning: codesigning failed, but continuing...${NC}"
+        }
+        
         echo -e "${GREEN}✅ Build successful!${NC}"
         echo -e "${GREEN}Application: ${FINAL_TARGET}${NC}"
         ls -lh "${FINAL_TARGET}"
