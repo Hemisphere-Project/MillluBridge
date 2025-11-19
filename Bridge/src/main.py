@@ -30,6 +30,9 @@ import tempfile
 import requests
 
 
+PERSIST_SETTINGS = False  # Toggle when external config storage becomes safe again
+
+
 def get_config_path():
     """Get platform-appropriate config file path
     
@@ -150,8 +153,12 @@ class MediaSyncManager:
 class MilluBridge:
     def __init__(self, osc_address=None, osc_port=None):
         # Load config first
-        self.config_file = str(get_config_path())
-        self.config = self.load_config()
+        if PERSIST_SETTINGS:
+            self.config_file = str(get_config_path())
+            self.config = self.load_config()
+        else:
+            self.config_file = None
+            self.config = self.get_default_config()
         
         # Use provided values or fall back to config
         self.osc_address = osc_address or self.config['gui_preferences']['osc_address']
@@ -238,6 +245,8 @@ class MilluBridge:
 
     def load_config(self):
         """Load configuration from config.json, forcing RF sim to disabled"""
+        if not PERSIST_SETTINGS:
+            return self.get_default_config()
         first_run = False
         
         try:
@@ -310,6 +319,8 @@ class MilluBridge:
     
     def save_config(self):
         """Save current configuration to config.json"""
+        if not PERSIST_SETTINGS:
+            return False
         try:
             # Update config from current state
             self.config['gui_preferences']['osc_address'] = self.osc_address
