@@ -4,6 +4,22 @@
 
 set -e
 
+select_python_for_arch() {
+    local target_arch="$1"
+    shift
+    for candidate in "$@"; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            local machine
+            machine="$("$candidate" -c 'import platform; print(platform.machine())' 2>/dev/null || true)"
+            if [[ "$machine" == "$target_arch" ]]; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 echo "🏗️  Building MilluBridge with Nuitka..."
 
 # Colors
@@ -21,9 +37,48 @@ else
     exit 1
 fi
 
-echo -e "${BLUE}Platform detected: ${PLATFORM}${NC}"
+ARCHITECTURE="$(uname -m)"
+BUILD_SUFFIX=""
+MACOS_MIN_VERSION=""
+MACOS_TARGET_ARCH=""
 
-# Install build dependencies
+echo -e "${BLUE}Platform detected: ${PLATFORM} (${ARCHITECTURE})${NC}"
+
+if [[ "$PLATFORM" == "macos" ]]; then
+    if [[ "$ARCHITECTURE" == "arm64" ]]; then
+        MACOS_MIN_VERSION="11.0" # macOS Big Sur (first Apple Silicon release)
+        BUILD_SUFFIX="-macos-silicon"
+        MACOS_TARGET_ARCH="arm64"
+    else
+        MACOS_MIN_VERSION="10.14" # macOS Mojave for Intel builds
+        BUILD_SUFFIX="-macos-intel"
+        MACOS_TARGET_ARCH="x86_64"
+    fi
+
+    export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN_VERSION}"
+    echo -e "${BLUE}Targeting macOS ${MACOSX_DEPLOYMENT_TARGET}+${NC}"
+
+    MIN_VERSION_FLAG="-mmacosx-version-min=${MACOS_MIN_VERSION}"
+    export CFLAGS="${MIN_VERSION_FLAG} ${CFLAGS:-}"
+    export CXXFLAGS="${MIN_VERSION_FLAG} ${CXXFLAGS:-}"
+    export LDFLAGS="${MIN_VERSION_FLAG} ${LDFLAGS:-}"
+else
+    BUILD_SUFFIX="-linux"
+fi
+
+# Install build dependencies (pin uv to an interpreter that matches host architecture unless overridden)
+if [[ -z "${UV_PYTHON:-}" ]]; then
+    if [[ "$PLATFORM" == "macos" ]]; then
+        if SELECTED_PY=$(select_python_for_arch "$ARCHITECTURE" python3.12 python3.11 python3.10 python3); then
+            export UV_PYTHON="$SELECTED_PY"
+        else
+            export UV_PYTHON="python3.12"
+        fi
+    else
+        export UV_PYTHON="python3.12"
+    fi
+fi
+
 echo -e "${BLUE}Installing build dependencies...${NC}"
 uv sync --extra build
 
@@ -93,25 +148,52 @@ if [[ "$PLATFORM" == "macos" ]]; then
     fi
     
     # macOS: Build as .app bundle (no terminal window, proper app icon support)
+    TARGET_ARCH_FLAG=""
+    if [ -n "${MACOS_TARGET_ARCH}" ]; then
+        TARGET_ARCH_FLAG="--macos-target-arch=${MACOS_TARGET_ARCH}"
+    fi
+
     uv run python -m nuitka \
         --standalone \
         --macos-create-app-bundle \
-        --macos-app-name="MilluBridge" \
+        --macos-app-name="MilluBridge${BUILD_SUFFIX}" \
         --output-dir=dist \
         --enable-plugin=no-qt \
         --assume-yes-for-downloads \
         --disable-console \
+        ${TARGET_ARCH_FLAG} \
         $ICON_FLAG \
         src/main.py
     
     # Check for .app bundle
     if [ -d "dist/main.app" ]; then
-        # Rename to MilluBridge.app
-        rm -rf "dist/MilluBridge.app"
-        mv "dist/main.app" "dist/MilluBridge.app"
+        APP_BUNDLE_PATH="dist/MilluBridge${BUILD_SUFFIX}.app"
+        rm -rf "${APP_BUNDLE_PATH}"
+        mv "dist/main.app" "${APP_BUNDLE_PATH}"
+
+        PLIST_PATH="${APP_BUNDLE_PATH}/Contents/Info.plist"
+        if [ -f "${PLIST_PATH}" ]; then
+            if ! /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null 2>&1; then
+                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null
+            fi
+
+            if ! /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersionByArchitecture" "${PLIST_PATH}" >/dev/null 2>&1; then
+                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture dict" "${PLIST_PATH}" >/dev/null
+            fi
+
+            if ! /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersionByArchitecture:${ARCHITECTURE} ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null 2>&1; then
+                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:${ARCHITECTURE} string ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null
+            fi
+
+            echo -e "${GREEN}✅ Minimum macOS version set to ${MACOS_MIN_VERSION}${NC}"
+        else
+            echo "⚠️ Unable to find Info.plist for stamping minimum macOS version"
+        fi
+
+        FINAL_TARGET="${APP_BUNDLE_PATH}"
         echo -e "${GREEN}✅ Build successful!${NC}"
-        echo -e "${GREEN}Application: dist/MilluBridge.app${NC}"
-        ls -lh "dist/MilluBridge.app"
+        echo -e "${GREEN}Application: ${FINAL_TARGET}${NC}"
+        ls -lh "${FINAL_TARGET}"
     else
         echo "❌ Build failed - .app bundle not found"
         exit 1
@@ -124,24 +206,27 @@ else
         ICON_FLAG="--linux-icon=icon-linux.png"
     fi
     
+    OUTPUT_BINARY="dist/MilluBridge${BUILD_SUFFIX}"
+
     uv run python -m nuitka \
         --onefile \
         --output-dir=dist \
-        --output-filename="MilluBridge-${PLATFORM}" \
+        --output-filename="MilluBridge${BUILD_SUFFIX}" \
         --enable-plugin=no-qt \
         --assume-yes-for-downloads \
         $ICON_FLAG \
         src/main.py
     
-    if [ -f "dist/MilluBridge-${PLATFORM}" ]; then
+    if [ -f "${OUTPUT_BINARY}" ]; then
+        FINAL_TARGET="${OUTPUT_BINARY}"
         echo -e "${GREEN}✅ Build successful!${NC}"
-        echo -e "${GREEN}Executable: dist/MilluBridge-${PLATFORM}${NC}"
+        echo -e "${GREEN}Executable: ${FINAL_TARGET}${NC}"
         
         # Make executable
-        chmod +x "dist/MilluBridge-${PLATFORM}"
+        chmod +x "${FINAL_TARGET}"
         
         # Show file size
-        ls -lh "dist/MilluBridge-${PLATFORM}"
+        ls -lh "${FINAL_TARGET}"
     else
         echo "❌ Build failed - executable not found"
         exit 1
@@ -150,15 +235,15 @@ fi
 
 echo ""
 if [[ "$PLATFORM" == "macos" ]]; then
-    echo "🎉 Done! Open with: open dist/MilluBridge.app"
+    echo "🎉 Done! Open with: open ${FINAL_TARGET}"
     echo ""
     if [ ! -f "icon.png" ]; then
-        echo "� Tip: Place icon.png (1024x1024 recommended) in Bridge/ for custom app icon"
+        echo "Tip: Place icon.png (1024x1024 recommended) in Bridge/ for a custom app icon"
     fi
 else
-    echo "🎉 Done! Run with: ./dist/MilluBridge-${PLATFORM}"
+    echo "🎉 Done! Run with: ./${FINAL_TARGET}"
     echo ""
     if [ ! -f "icon.png" ]; then
-        echo "💡 Tip: Place icon.png in Bridge/ for custom app icon"
+        echo "Tip: Place icon.png in Bridge/ for a custom app icon"
     fi
 fi
