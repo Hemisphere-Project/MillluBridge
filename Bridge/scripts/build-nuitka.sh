@@ -46,7 +46,7 @@ echo -e "${BLUE}Platform detected: ${PLATFORM} (${ARCHITECTURE})${NC}"
 
 if [[ "$PLATFORM" == "macos" ]]; then
     if [[ "$ARCHITECTURE" == "arm64" ]]; then
-        MACOS_MIN_VERSION="11.0" # macOS Big Sur (first Apple Silicon release)
+        MACOS_MIN_VERSION="14.0" # macOS Sonoma for Apple Silicon
         BUILD_SUFFIX="-macos-silicon"
         MACOS_TARGET_ARCH="arm64"
     else
@@ -55,9 +55,13 @@ if [[ "$PLATFORM" == "macos" ]]; then
         MACOS_TARGET_ARCH="x86_64"
     fi
 
-    # Note: Not setting MACOSX_DEPLOYMENT_TARGET or compiler flags to avoid runtime crashes
-    # Let Nuitka and system defaults handle this
-    echo -e "${BLUE}Building for macOS (architecture: ${ARCHITECTURE})${NC}"
+    export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN_VERSION}"
+    echo -e "${BLUE}Targeting macOS ${MACOSX_DEPLOYMENT_TARGET}+ (${ARCHITECTURE})${NC}"
+
+    MIN_VERSION_FLAG="-mmacosx-version-min=${MACOS_MIN_VERSION}"
+    export CFLAGS="${MIN_VERSION_FLAG} ${CFLAGS:-}"
+    export CXXFLAGS="${MIN_VERSION_FLAG} ${CXXFLAGS:-}"
+    export LDFLAGS="${MIN_VERSION_FLAG} ${LDFLAGS:-}"
 else
     BUILD_SUFFIX="-linux"
 fi
@@ -192,10 +196,27 @@ if [[ "$PLATFORM" == "macos" ]]; then
         rm -rf "${APP_BUNDLE_PATH}"
         mv "dist/main.app" "${APP_BUNDLE_PATH}"
 
-        # Skip strict version enforcement to avoid runtime incompatibilities
-        echo -e "${BLUE}Bundle created without strict version requirements${NC}"
-
         FINAL_TARGET="${APP_BUNDLE_PATH}"
+        
+        # Set minimum macOS version in Info.plist
+        PLIST_PATH="${APP_BUNDLE_PATH}/Contents/Info.plist"
+        if [ -f "${PLIST_PATH}" ]; then
+            if ! /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null 2>&1; then
+                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null
+            fi
+
+            if ! /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersionByArchitecture" "${PLIST_PATH}" >/dev/null 2>&1; then
+                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture dict" "${PLIST_PATH}" >/dev/null
+            fi
+
+            if ! /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersionByArchitecture:${ARCHITECTURE} ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null 2>&1; then
+                /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersionByArchitecture:${ARCHITECTURE} string ${MACOS_MIN_VERSION}" "${PLIST_PATH}" >/dev/null
+            fi
+
+            echo -e "${GREEN}✅ Minimum macOS version set to ${MACOS_MIN_VERSION}${NC}"
+        else
+            echo "⚠️ Unable to find Info.plist for stamping minimum macOS version"
+        fi
         
         # Ad-hoc codesign the bundle to fix entitlements (prevents SIGBUS crashes)
         echo -e "${BLUE}Signing application bundle...${NC}"
