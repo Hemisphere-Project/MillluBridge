@@ -39,27 +39,36 @@ def get_config_path():
     - Windows: %APPDATA%/MilluBridge/config.json
     - Fallback: ./config.json (current directory)
     """
-    if os.name == 'posix':
-        # macOS and Linux
-        if os.uname().sysname == 'Darwin':
-            # macOS
-            config_dir = Path.home() / "Library" / "Application Support" / "MilluBridge"
+    try:
+        if os.name == 'posix':
+            # macOS and Linux
+            if os.uname().sysname == 'Darwin':
+                # macOS
+                config_dir = Path.home() / "Library" / "Application Support" / "MilluBridge"
+            else:
+                # Linux
+                config_dir = Path.home() / ".config" / "millubridge"
+        elif os.name == 'nt':
+            # Windows
+            appdata = os.getenv('APPDATA')
+            config_dir = Path(appdata) / "MilluBridge" if appdata else Path(".")
         else:
-            # Linux
-            config_dir = Path.home() / ".config" / "millubridge"
-    elif os.name == 'nt':
-        # Windows
-        appdata = os.getenv('APPDATA')
-        config_dir = Path(appdata) / "MilluBridge" if appdata else Path(".")
-    else:
-        # Fallback
-        config_dir = Path(".")
-    
-    # Create directory if it doesn't exist
-    if config_dir != Path("."):
-        config_dir.mkdir(parents=True, exist_ok=True)
-    
-    return config_dir / "config.json"
+            # Fallback
+            config_dir = Path(".")
+        
+        # Create directory if it doesn't exist
+        if config_dir != Path("."):
+            try:
+                config_dir.mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError) as e:
+                print(f"Warning: Could not create config directory {config_dir}: {e}")
+                print("Falling back to current directory for config")
+                config_dir = Path(".")
+        
+        return config_dir / "config.json"
+    except Exception as e:
+        print(f"Error determining config path: {e}, using current directory")
+        return Path(".") / "config.json"
 
 class MediaSyncManager:
     """Manages media synchronization state and throttling for each layer"""
@@ -234,8 +243,12 @@ class MilluBridge:
         try:
             # Load config from proper location (no migration needed for .app bundles)
             if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    config = json.load(f)
+                try:
+                    with open(self.config_file, 'r') as f:
+                        config = json.load(f)
+                except (IOError, OSError, PermissionError) as e:
+                    print(f"Error reading config file: {e}, using defaults")
+                    return self.get_default_config()
                 
                 # Force RF simulation OFF on load (safety measure)
                 if 'sender_config' in config:
@@ -264,13 +277,14 @@ class MilluBridge:
                 first_run = True
                 config = self.get_default_config()
                 
-                # Save default config for first run
+                # Save default config for first run (with error handling)
                 try:
                     with open(self.config_file, 'w') as f:
                         json.dump(config, f, indent=2)
                     print(f"✅ Default config saved to {self.config_file}")
-                except Exception as e:
+                except (IOError, OSError, PermissionError) as e:
                     print(f"⚠️ Could not save default config: {e}")
+                    print("Config will be kept in memory only")
                 
                 return config
                 
@@ -310,6 +324,9 @@ class MilluBridge:
             
             print(f"Config saved to {self.config_file}")
             return True
+        except (IOError, OSError, PermissionError) as e:
+            print(f"Error saving config (file access): {e}")
+            return False
         except Exception as e:
             print(f"Error saving config: {e}")
             return False
