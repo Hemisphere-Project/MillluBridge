@@ -153,6 +153,17 @@ if [[ "$PLATFORM" == "macos" ]]; then
         TARGET_ARCH_FLAG="--macos-target-arch=${MACOS_TARGET_ARCH}"
     fi
 
+    # Detect Python for scons (needed for Homebrew Python on macOS)
+    PYTHON_FOR_SCONS_FLAG=""
+    if command -v brew >/dev/null 2>&1; then
+        # Try to get Homebrew Python path
+        BREW_PYTHON_PREFIX=$(brew --prefix python 2>/dev/null || brew --prefix python@3.14 2>/dev/null || brew --prefix python@3.13 2>/dev/null || brew --prefix python@3.12 2>/dev/null || true)
+        if [ -n "$BREW_PYTHON_PREFIX" ] && [ -x "${BREW_PYTHON_PREFIX}/bin/python3" ]; then
+            echo -e "${BLUE}Using Homebrew Python for scons: ${BREW_PYTHON_PREFIX}/bin/python3${NC}"
+            PYTHON_FOR_SCONS_FLAG="--python-for-scons=${BREW_PYTHON_PREFIX}/bin/python3"
+        fi
+    fi
+
     uv run python -m nuitka \
         --standalone \
         --macos-create-app-bundle \
@@ -162,6 +173,7 @@ if [[ "$PLATFORM" == "macos" ]]; then
         --assume-yes-for-downloads \
         --disable-console \
         ${TARGET_ARCH_FLAG} \
+        ${PYTHON_FOR_SCONS_FLAG} \
         $ICON_FLAG \
         src/main.py
     
