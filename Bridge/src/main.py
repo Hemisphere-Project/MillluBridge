@@ -18,6 +18,7 @@ import dearpygui.dearpygui as dpg
 from osc.server import OSCServer
 from midi.output_manager import OutputManager
 from midi.input_manager import InputManager
+from dali_control.manager import DaliManager
 import time
 import threading
 import re
@@ -153,7 +154,7 @@ class MediaSyncManager:
         self.throttle_interval = max(0.01, interval)  # Minimum 10ms
 
 class MilluBridge:
-    def __init__(self, osc_address=None, osc_port=None):
+    def __init__(self, osc_port=None):
         # Load config first
         if PERSIST_SETTINGS:
             self.config_file = str(get_config_path())
@@ -162,14 +163,16 @@ class MilluBridge:
             self.config_file = None
             self.config = self.get_default_config()
         
-        # Use provided values or fall back to config
-        self.osc_address = osc_address or self.config['gui_preferences']['osc_address']
+        # OSC address is always 0.0.0.0 to listen on all interfaces
+        self.osc_address = "0.0.0.0"
+        # Use provided port or fall back to config
         self.osc_port = osc_port or self.config['gui_preferences']['osc_port']
         self.osc_server = None
         self.output_manager = OutputManager()
         self.input_manager = InputManager(
             sysex_callback=self.handle_sysex_message
         )
+        self.dali_manager = DaliManager(status_callback=self.on_dali_status_changed)
         self.selected_port = None
         self.is_running = False
         self.last_osc_time = 0
@@ -190,6 +193,14 @@ class MilluBridge:
         self.layers = {}  # {layer_name: {state, filename, position, duration}}
         self.layer_rows = {}  # {layer_name: row_tag} - track row tags for updates
         self.show_all_messages = False
+        
+        # Lights tracking
+        self.lights = {}  # {channel: value} - track light channel values
+        self.light_rows = {}  # {channel: row_tag} - track row tags for updates
+        self.dali_channels_present = {}  # {channel: bool} - track if DALI channel is responding
+        self.dali_scan_thread = None
+        self.stop_dali_scan = False
+        self.lights_lock = threading.Lock()  # Protect lights table updates
         
         # Remote Nowdes tracking
         self.remote_nowdes = {}  # {mac: {name, version, layer}}
@@ -242,6 +253,9 @@ class MilluBridge:
         # Start running state query thread
         self.start_running_state_thread()
         
+        # Start DALI scan thread for channel detection
+        self.start_dali_scan_thread()
+        
         # Auto-start bridge
         self.start_bridge()
 
@@ -269,7 +283,6 @@ class MilluBridge:
                 if 'gui_preferences' not in config:
                     config['gui_preferences'] = {}
                 
-                config['gui_preferences'].setdefault('osc_address', '127.0.0.1')
                 config['gui_preferences'].setdefault('osc_port', 8000)
                 config['gui_preferences'].setdefault('media_sync_throttle_hz', 10)
                 config['gui_preferences'].setdefault('frame_correction_frames', 0)
@@ -312,7 +325,6 @@ class MilluBridge:
             },
             "gui_preferences": {
                 "window_position": [100, 100],
-                "osc_address": "127.0.0.1",
                 "osc_port": 8000,
                 "media_sync_throttle_hz": 10,
                 "frame_correction_frames": 0
@@ -325,7 +337,6 @@ class MilluBridge:
             return False
         try:
             # Update config from current state
-            self.config['gui_preferences']['osc_address'] = self.osc_address
             self.config['gui_preferences']['osc_port'] = self.osc_port
             
             # Calculate throttle Hz from interval
@@ -358,9 +369,6 @@ class MilluBridge:
                     dpg.add_text("Millumin Settings", color=(150, 200, 255))
                     dpg.add_text(f"v{VERSION}", color=(120, 120, 120))
             with dpg.group(horizontal=True):
-                dpg.add_text("OSC Address:")
-                dpg.add_input_text(tag="osc_address_input", default_value=self.osc_address, 
-                                 width=150, on_enter=True, callback=self.on_osc_settings_changed)
                 dpg.add_text("OSC Port:")
                 dpg.add_input_text(tag="osc_port_input", default_value=str(self.osc_port), 
                                  width=100, on_enter=True, callback=self.on_osc_settings_changed)
@@ -383,31 +391,30 @@ class MilluBridge:
             with dpg.group(horizontal=True):
                 dpg.add_text("Throttle (Hz):")
                 dpg.add_slider_int(tag="throttle_hz_slider", default_value=10, 
-                                  min_value=1, max_value=60, width=150,
+                                  min_value=1, max_value=60, width=100,
                                   callback=self.on_throttle_changed)
-                dpg.add_text("MTC Framerate:")
+                dpg.add_text("  MTC:")
                 dpg.add_input_int(tag="mtc_framerate_input", 
                                  default_value=self.sync_settings['mtc_framerate'],
-                                 width=60, step=0, on_enter=True,
+                                 width=30, step=0, on_enter=True,
                                  callback=self.on_sync_setting_changed)
-                dpg.add_text("fps")
+                dpg.add_text("fps  ")
             
-            with dpg.group(horizontal=True):
-                dpg.add_text("Freewheel Timeout:")
+                dpg.add_text("Freewheel:")
                 dpg.add_input_float(tag="freewheel_timeout_input",
                                    default_value=self.sync_settings['freewheel_timeout'],
-                                   width=60, step=0, format="%.1f", on_enter=True,
+                                   width=30, step=0, format="%.1f", on_enter=True,
                                    callback=self.on_sync_setting_changed)
-                dpg.add_text("s")
-                dpg.add_text("   Desync Threshold:")
+                dpg.add_text("s. ")
+                dpg.add_text("Desync max:")
                 dpg.add_input_int(tag="desync_threshold_input",
                                  default_value=self.sync_settings['clock_desync_threshold'],
-                                 width=60, step=0, on_enter=True,
+                                 width=40, step=0, on_enter=True,
                                  callback=self.on_sync_setting_changed)
                 dpg.add_text("ms")
             
             with dpg.group(horizontal=True):
-                dpg.add_text("Frame Correction:")
+                dpg.add_text("Correction:")
                 dpg.add_input_int(tag="frame_correction_input",
                                  default_value=self.sync_settings['frame_correction_frames'],
                                  width=80, step=1, on_enter=True,
@@ -429,44 +436,79 @@ class MilluBridge:
             
             dpg.add_separator()
             
-            # Millumin Layers section
-            dpg.add_text("Millumin Layers", color=(150, 200, 255))
-            with dpg.table(header_row=True, tag="layers_table", 
-                          borders_innerH=True, borders_outerH=True, 
-                          borders_innerV=True, borders_outerV=True,
-                          row_background=True, resizable=True, height=150):
-                dpg.add_table_column(label="Layers", width_fixed=True, init_width_or_weight=150)
-                dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=60)
-                dpg.add_table_column(label="Filename", width_stretch=True)
-                dpg.add_table_column(label="Position", width_fixed=True, init_width_or_weight=80)
-                dpg.add_table_column(label="Duration", width_fixed=True, init_width_or_weight=80)
+            # Split layout: Millumin Layers (left 3/4) and Lights (right 1/4)
+            with dpg.group(horizontal=True):
+                # Left 3/4 - Millumin Layers section
+                with dpg.child_window(width=-250, height=200, border=False):
+                    dpg.add_text("MilluBridge Layers", color=(150, 200, 255))
+                    with dpg.table(header_row=True, tag="layers_table", 
+                                  borders_innerH=True, borders_outerH=True, 
+                                  borders_innerV=True, borders_outerV=True,
+                                  row_background=True, resizable=True, height=-1):
+                        dpg.add_table_column(label="Layers", width_fixed=True, init_width_or_weight=150)
+                        dpg.add_table_column(label="State", width_fixed=True, init_width_or_weight=60)
+                        dpg.add_table_column(label="Filename", width_stretch=True)
+                        dpg.add_table_column(label="Position", width_fixed=True, init_width_or_weight=80)
+                        dpg.add_table_column(label="Duration", width_fixed=True, init_width_or_weight=80)
+                
+                # Right 1/4 - Lights section
+                with dpg.child_window(width=-1, height=200, border=False):
+                    dpg.add_text("MilluBridge Lights", color=(150, 200, 255))
+                    with dpg.table(header_row=True, tag="lights_table",
+                                  borders_innerH=True, borders_outerH=True,
+                                  borders_innerV=True, borders_outerV=True,
+                                  row_background=True, resizable=True, height=-1):
+                        dpg.add_table_column(label="Channel", width_fixed=True, init_width_or_weight=80)
+                        dpg.add_table_column(label="Value", width_fixed=True, init_width_or_weight=60)
+                        dpg.add_table_column(label="Status", width_stretch=True)
             
             dpg.add_separator()
             
-            # MIDI Settings section
-            dpg.add_text("Local Nowde", color=(150, 200, 255))
-            # Nowde device selection
+            # Split layout: Local Nowde (left 3/4) and Dali Master (right 1/4)
             with dpg.group(horizontal=True):
-                dpg.add_text("Select Device:")
-                dpg.add_combo(tag="nowde_device_combo", items=["Scanning..."], width=250,
-                             callback=self.on_nowde_device_selected)
-                dpg.add_button(label="Refresh", callback=self.manual_refresh_nowde_devices, width=80)
-                dpg.add_spacer(width=20)
-                dpg.add_text("USB Status:")
-                dpg.add_text("[X]", tag="nowde_status_indicator", color=(255, 0, 0))  # Red by default
-                dpg.add_text("Not connected", tag="nowde_status_text", color=(150, 150, 150))
-                dpg.add_button(label="Show Logs", tag="nowde_logs_toggle_btn", callback=self.toggle_nowde_logs, width=100)
-            
-            # Nowde version and firmware upgrade
-            with dpg.group(horizontal=True):
-                dpg.add_text("Nowde Version:")
-                dpg.add_text("--", tag="firmware_version_text", color=(150, 150, 150))
-                dpg.add_spacer(width=20)
-                dpg.add_button(label="Upgrade Firmware", tag="upgrade_nowde_btn",
-                             callback=self.upgrade_nowde_firmware, width=150)
-            dpg.add_progress_bar(tag="firmware_upload_progress", 
-                                default_value=0.0, width=-1, show=False)
-            dpg.add_text("", tag="firmware_upload_status", color=(150, 150, 150))
+                # Left 2/3 - Local Nowde section
+                with dpg.child_window(width=-250, height=220, border=False):
+                    dpg.add_text("Local Nowde", color=(150, 200, 255))
+                    # Nowde device selection
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Select Device:")
+                        dpg.add_combo(tag="nowde_device_combo", items=["Scanning..."], width=250,
+                                     callback=self.on_nowde_device_selected)
+                        dpg.add_button(label="Refresh", callback=self.manual_refresh_nowde_devices, width=80)
+                    
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("USB Status:")
+                        dpg.add_text("[X]", tag="nowde_status_indicator", color=(255, 0, 0))  # Red by default
+                        dpg.add_text("Not connected", tag="nowde_status_text", color=(150, 150, 150))
+                        dpg.add_button(label="Show Logs", tag="nowde_logs_toggle_btn", callback=self.toggle_nowde_logs, width=100)
+                    
+                    # Nowde version and firmware upgrade
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Nowde Version:")
+                        dpg.add_text("--", tag="firmware_version_text", color=(150, 150, 150))
+                        dpg.add_spacer(width=20)
+                        dpg.add_button(label="Upgrade Firmware", tag="upgrade_nowde_btn",
+                                     callback=self.upgrade_nowde_firmware, width=150)
+                    dpg.add_progress_bar(tag="firmware_upload_progress", 
+                                        default_value=0.0, width=-1, show=False)
+                    dpg.add_text("", tag="firmware_upload_status", color=(150, 150, 150))
+                
+                # Right 1/3 - Dali Master section
+                with dpg.child_window(width=-1, height=220, border=False):
+                    dpg.add_text("Dali Master", color=(150, 200, 255))
+                    
+                    # DALI status
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("USB Status:")
+                        dpg.add_text("[X]", tag="dali_status_indicator", color=(255, 0, 0))  # Red by default
+                        dpg.add_text("Not connected", tag="dali_status_text", color=(150, 150, 150))
+                    
+                    dpg.add_spacer(height=10)
+                    
+                    # DALI control buttons
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="Blackout", callback=self.dali_blackout, width=115)
+                        dpg.add_button(label="All On", callback=self.dali_all_on, width=115)
             
             dpg.add_separator()
             
@@ -500,7 +542,7 @@ class MilluBridge:
             # Simulation Clock control
             dpg.add_text("Media Simulation", color=(150, 200, 255))
             with dpg.group(horizontal=True):
-                dpg.add_text("Clock Duration:")
+                dpg.add_text("Duration:")
                 dpg.add_slider_float(tag="sim_clock_duration_slider",
                                     default_value=30.0,
                                     min_value=5.0, max_value=120.0,
@@ -510,7 +552,7 @@ class MilluBridge:
                 dpg.add_button(label="Start/Stop", tag="sim_clock_btn",
                              callback=self.toggle_simulation_clock, width=100)
                 dpg.add_text("Stopped", tag="sim_clock_status", color=(150, 150, 150))
-                dpg.add_spacer(width=20)
+                dpg.add_spacer(width=10)
                 dpg.add_text("Position:")
                 dpg.add_text("0.0s / 30.0s", tag="sim_clock_position_text", color=(150, 150, 150))
             
@@ -519,10 +561,9 @@ class MilluBridge:
                 dpg.add_checkbox(label="Simulate Bad RF", tag="rf_sim_checkbox",
                                default_value=self.config['sender_config']['rf_simulation_enabled'],
                                callback=self.on_rf_sim_changed)
-                dpg.add_text("Max Delay:")
                 dpg.add_slider_int(tag="rf_sim_max_delay_slider",
                                  default_value=self.config['sender_config']['rf_simulation_max_delay_ms'],
-                                 min_value=1, max_value=1000, width=150,
+                                 min_value=1, max_value=1000, width=100,
                                  callback=self.on_rf_sim_max_delay_changed)
                 dpg.add_text("ms")
 
@@ -930,11 +971,14 @@ class MilluBridge:
         self.last_osc_time = time.time()
         self.update_osc_status(True)
         
-        # Parse Millumin messages
+        # Parse Millumin messages (layers)
         is_millumin = self.parse_millumin_message(message)
         
+        # Parse light messages
+        is_light = self.parse_light_message(message)
+        
         # Log message (filtered or all)
-        if self.show_all_messages or is_millumin:
+        if self.show_all_messages or is_millumin or is_light:
             self.update_osc_log(message)
     
     def is_layer_in_simulation(self, layer_name):
@@ -945,6 +989,65 @@ class MilluBridge:
                 if sim_mode != 'Disabled':
                     return True
         return False
+    
+    def parse_light_message(self, message):
+        """Parse light OSC messages and update light tracking"""
+        # Message format: "/L1: (255,)" or "/L1: 255" or "/L1 255"
+        if not message.startswith("/L"):
+            return False
+        
+        try:
+            # Split address and value
+            # Handle both formats: "/L1: 255" and "/L1 255"
+            if ": " in message:
+                address, value_str = message.split(": ", 1)
+            elif " " in message:
+                address, value_str = message.split(" ", 1)
+            else:
+                return False
+            
+            # Extract channel number from /L<channel>
+            channel_str = address[2:]  # Skip "/L"
+            
+            # Parse channel number
+            try:
+                channel = int(channel_str)
+            except ValueError:
+                return False
+            
+            # Parse value (remove parentheses, commas, and whitespace)
+            value_str = value_str.strip().strip("()").strip(",").strip()
+            
+            # Handle empty value
+            if not value_str:
+                return False
+            
+            try:
+                value = int(float(value_str))  # Convert to int (handles both int and float strings)
+            except ValueError:
+                return False
+            
+            # Clamp value to 0-255 range
+            value = max(0, min(255, value))
+            
+            # Update lights dictionary (thread-safe)
+            with self.lights_lock:
+                self.lights[channel] = value
+            
+            # Immediately push to DALI if connected
+            if self.dali_manager and self.dali_manager.is_connected:
+                dali_address = channel - 1  # L1 -> DALI 0, L2 -> DALI 1, etc.
+                if 0 <= dali_address <= 63:
+                    self.dali_manager.set_level(dali_address, value)
+            
+            # Update UI table
+            self.update_lights_table()
+            
+            return True
+            
+        except Exception as e:
+            # If parsing fails, it's not a valid light message
+            return False
     
     def parse_millumin_message(self, message):
         """Parse Millumin OSC messages and update layer tracking"""
@@ -1089,12 +1192,27 @@ class MilluBridge:
         if not dpg.does_item_exist("layers_table"):
             return
         
-        # Update or add rows for each layer (skip layers in simulation mode)
-        for layer_name, layer_data in sorted(self.layers.items()):
-            # Skip layers that are being simulated
-            if self.is_layer_in_simulation(layer_name):
-                continue
-            
+        # Get current layers (excluding simulated ones), sorted alphabetically
+        current_layers = sorted(
+            [(name, data) for name, data in self.layers.items() if not self.is_layer_in_simulation(name)],
+            key=lambda x: x[0].lower()
+        )
+        current_layer_names = [name for name, _ in current_layers]
+        existing_layer_names = [name for name in self.layer_rows.keys() if not self.is_layer_in_simulation(name)]
+        
+        # Check if we need to rebuild the table (new layer or order changed)
+        needs_rebuild = current_layer_names != existing_layer_names
+        
+        if needs_rebuild:
+            # Clear all existing rows
+            for layer_name in list(self.layer_rows.keys()):
+                row_tag = f"layer_row_{layer_name}"
+                if dpg.does_item_exist(row_tag):
+                    dpg.delete_item(row_tag)
+            self.layer_rows.clear()
+        
+        # Update or add rows for each layer, sorted alphabetically
+        for layer_name, layer_data in current_layers:
             row_tag = f"layer_row_{layer_name}"
             
             if layer_name not in self.layer_rows:
@@ -1132,6 +1250,87 @@ class MilluBridge:
                 
                 if dpg.does_item_exist(f"{row_tag}_duration"):
                     dpg.set_value(f"{row_tag}_duration", f"{layer_data['duration']:.2f}s")
+    
+    def update_lights_table(self):
+        """Update the Lights table - always rebuild for consistency"""
+        if not dpg.does_item_exist("lights_table"):
+            return
+        
+        with self.lights_lock:
+            # Always clear and rebuild to avoid stale state issues
+            for channel in list(self.light_rows.keys()):
+                row_tag = f"light_row_{channel}"
+                if dpg.does_item_exist(row_tag):
+                    dpg.delete_item(row_tag)
+            self.light_rows.clear()
+            
+            # Take snapshots of current state
+            declared_channels = dict(self.lights)  # {channel: value}
+            presence_status = dict(self.dali_channels_present)  # {channel: bool}
+        
+        # Collect detected-only channels (from DALI scan, present but not declared)
+        detected_only_channels = set()
+        for channel, is_present in presence_status.items():
+            if is_present and channel not in declared_channels and 1 <= channel <= 16:
+                detected_only_channels.add(channel)
+        
+        # Sort: declared channels first, then detected-only at bottom
+        declared_sorted = sorted(declared_channels.keys())
+        detected_sorted = sorted(detected_only_channels)
+        
+        # Add declared channels (normal display)
+        for channel in declared_sorted:
+            value = declared_channels[channel]
+            row_tag = f"light_row_{channel}"
+            
+            # Get DALI presence status for this channel
+            is_present = presence_status.get(channel, None)
+            if is_present is None:
+                status_text = "..."
+                status_color = (150, 150, 150)
+            elif is_present:
+                status_text = "OK"
+                status_color = (0, 255, 0)
+            else:
+                status_text = "No Response"
+                status_color = (255, 165, 0)
+            
+            with dpg.table_row(parent="lights_table", tag=row_tag):
+                # Clickable channel name for identify
+                dpg.add_button(
+                    label=f"L{channel}", 
+                    tag=f"{row_tag}_channel",
+                    callback=lambda s, a, u: self.identify_channel(u),
+                    user_data=channel,
+                    width=-1
+                )
+                dpg.add_text(str(value), tag=f"{row_tag}_value")
+                dpg.add_text(status_text, tag=f"{row_tag}_status", color=status_color)
+            
+            self.light_rows[channel] = row_tag
+        
+        # Add detected-only channels at bottom (greyed display, no value)
+        for channel in detected_sorted:
+            row_tag = f"light_row_{channel}"
+            
+            # These are always present (that's why they're in detected_only)
+            status_text = "OK"
+            status_color = (0, 255, 0)
+            
+            with dpg.table_row(parent="lights_table", tag=row_tag):
+                # Clickable channel name for identify (greyed style)
+                dpg.add_button(
+                    label=f"L{channel}", 
+                    tag=f"{row_tag}_channel",
+                    callback=lambda s, a, u: self.identify_channel(u),
+                    user_data=channel,
+                    width=-1
+                )
+                dpg.bind_item_theme(f"{row_tag}_channel", "greyed_button_theme") if dpg.does_item_exist("greyed_button_theme") else None
+                dpg.add_text("", tag=f"{row_tag}_value")
+                dpg.add_text(status_text, tag=f"{row_tag}_status", color=status_color)
+            
+            self.light_rows[channel] = row_tag
     
     def on_toggle_filter(self, sender, app_data):
         """Toggle between showing all messages or only Millumin messages"""
@@ -1387,6 +1586,77 @@ class MilluBridge:
         self.running_state_thread.start()
         print("Running state query thread started")
     
+    def start_dali_scan_thread(self):
+        """Start background thread to scan for DALI channel presence"""
+        self.stop_dali_scan = False
+        
+        def dali_scan_loop():
+            # Initial delay to let connection stabilize
+            time.sleep(2)
+            
+            while not self.stop_dali_scan:
+                try:
+                    # Scan DALI addresses 0-15 (L1-L16)
+                    if self.dali_manager and self.dali_manager.is_connected:
+                        # Collect all scan results first
+                        scan_results = {}
+                        for dali_address in range(16):
+                            channel = dali_address + 1  # DALI 0 -> L1, DALI 1 -> L2, etc.
+                            is_present = self.dali_manager.check_channel_present(dali_address)
+                            scan_results[channel] = is_present
+                        
+                        # Update all results atomically
+                        with self.lights_lock:
+                            self.dali_channels_present.clear()
+                            self.dali_channels_present.update(scan_results)
+                        
+                        detected = [ch for ch, present in scan_results.items() if present]
+                        if detected:
+                            print(f"[DALI] Scan complete: detected L{', L'.join(map(str, detected))}")
+                        
+                        # Update UI once after all scanning is done
+                        self.update_lights_table()
+                    
+                    # Scan every 30 seconds (conservative to avoid congestion)
+                    time.sleep(30)
+                except Exception as e:
+                    print(f"Error in DALI scan thread: {e}")
+                    time.sleep(30)
+        
+        self.dali_scan_thread = threading.Thread(target=dali_scan_loop, daemon=True)
+        self.dali_scan_thread.start()
+    
+    def identify_channel(self, channel: int):
+        """Run identify pattern (OFF/ON/OFF/ON/OFF) on a DALI channel"""
+        if not self.dali_manager or not self.dali_manager.is_connected:
+            self.update_osc_log(f"DALI: Cannot identify L{channel} - not connected")
+            return
+        
+        def identify_sequence():
+            dali_address = channel - 1
+            if not (0 <= dali_address <= 63):
+                return
+            
+            # Get original value
+            with self.lights_lock:
+                original_value = self.lights.get(channel, 0)
+            
+            try:
+                # OFF/ON/OFF/ON/OFF pattern
+                pattern = [0, 254, 0, 254, 0, 254, 0]
+                for level in pattern:
+                    self.dali_manager.set_level(dali_address, level)
+                    time.sleep(0.2)
+                
+                # Restore original value
+                self.dali_manager.set_level(dali_address, original_value)
+            except Exception as e:
+                print(f"Error in identify sequence: {e}")
+        
+        # Run in background thread to not block GUI
+        threading.Thread(target=identify_sequence, daemon=True).start()
+        self.update_osc_log(f"DALI: Identifying L{channel}")
+    
     def auto_refresh_midi_devices(self):
         """Background thread to periodically check for Nowde devices"""
         last_ports = set()
@@ -1421,12 +1691,12 @@ class MilluBridge:
         
         if dpg.does_item_exist("status_text"):
             if active:
-                text = f"Receiving on {self.osc_address}:{self.osc_port}"
+                text = f"Receiving on port {self.osc_port}"
                 # color = (0, 255, 0)
                 color = (150, 150, 150)
             else:
                 if self.is_running:
-                    text = f"Listening on {self.osc_address}:{self.osc_port}"
+                    text = f"Listening on port {self.osc_port}"
                     color = (150, 150, 150)
                 else:
                     text = "Stopped"
@@ -1716,18 +1986,16 @@ class MilluBridge:
     
     def on_osc_settings_changed(self, sender, app_data):
         """Callback when OSC settings are changed"""
-        new_address = dpg.get_value("osc_address_input")
         try:
             new_port = int(dpg.get_value("osc_port_input"))
         except ValueError:
             self.update_osc_log("ERROR: Invalid port number!")
             return
         
-        # Check if settings actually changed
-        if new_address != self.osc_address or new_port != self.osc_port:
-            self.osc_address = new_address
+        # Check if port actually changed
+        if new_port != self.osc_port:
             self.osc_port = new_port
-            self.update_osc_log(f"OSC settings changed to {self.osc_address}:{self.osc_port}")
+            self.update_osc_log(f"OSC port changed to {self.osc_port}")
             # Save config
             self.save_config()
             # Restart the bridge with new settings
@@ -1752,7 +2020,7 @@ class MilluBridge:
         self.is_running = True
         self.osc_server.start()
         self.last_osc_time = time.time()
-        self.update_osc_log(f"Bridge started on {self.osc_address}:{self.osc_port}")
+        self.update_osc_log(f"Bridge started on port {self.osc_port} (listening on all interfaces)")
         
         # Start status check thread
         if self.status_check_thread is None or not self.status_check_thread.is_alive():
@@ -1900,12 +2168,76 @@ class MilluBridge:
             # Sleep for throttle interval
             time.sleep(self.sync_settings['throttle_interval'])
     
+    def on_dali_status_changed(self, connected: bool, device_path: str):
+        """Callback when DALI connection status changes"""
+        self.update_dali_status(connected, device_path)
+        if connected:
+            self.update_osc_log(f"DALI Master connected: {device_path if device_path else 'Unknown'}")
+        else:
+            self.update_osc_log("DALI Master disconnected")
+    
+    def update_dali_status(self, connected: bool, device_path: str = ''):
+        """Update the DALI status indicator in GUI"""
+        if dpg.does_item_exist("dali_status_indicator"):
+            if connected:
+                dpg.set_value("dali_status_indicator", "[OK]")
+                dpg.configure_item("dali_status_indicator", color=(0, 255, 0))
+            else:
+                dpg.set_value("dali_status_indicator", "[X]")
+                dpg.configure_item("dali_status_indicator", color=(255, 0, 0))
+        
+        if dpg.does_item_exist("dali_status_text"):
+            if connected:
+                if device_path:
+                    # Show just the device name, not full path
+                    device_name = device_path.split('/')[-1] if '/' in device_path else device_path
+                    print(f"DALI device name: {device_path} -> {device_name}")
+                    # dpg.set_value("dali_status_text", device_name)
+                    dpg.set_value("dali_status_text", "Hasseb DALI")
+                else:
+                    dpg.set_value("dali_status_text", "Connected")
+                dpg.configure_item("dali_status_text", color=(0, 255, 0))
+            else:
+                dpg.set_value("dali_status_text", "Not connected")
+                dpg.configure_item("dali_status_text", color=(150, 150, 150))
+    
+    def dali_all_on(self):
+        """Broadcast All On command to all DALI lights"""
+        if self.dali_manager and self.dali_manager.is_connected:
+            # Update internal values and UI
+            with self.lights_lock:
+                for channel in list(self.lights.keys()):
+                    self.lights[channel] = 255
+            
+            self.dali_manager.broadcast_on()
+            self.update_osc_log("DALI: All On (broadcast)")
+            self.update_lights_table()
+        else:
+            self.update_osc_log("DALI: Device not connected")
+    
+    def dali_blackout(self):
+        """Broadcast Blackout (Off) command to all DALI lights"""
+        if self.dali_manager and self.dali_manager.is_connected:
+            # Update internal values and UI
+            with self.lights_lock:
+                for channel in list(self.lights.keys()):
+                    self.lights[channel] = 0
+            
+            self.dali_manager.broadcast_off()
+            self.update_osc_log("DALI: Blackout (broadcast)")
+            self.update_lights_table()
+        else:
+            self.update_osc_log("DALI: Device not connected")
+    
     def on_quit(self):
         """Callback for Quit button"""
         self.stop_midi_refresh = True
         self.stop_media_sync = True
         self.stop_simulation_clock = True
+        self.stop_dali_scan = True
         self.simulation_clock_running = False
+        if self.dali_manager:
+            self.dali_manager.stop_monitoring_thread()
         if self.is_running:
             self.stop_bridge()
         dpg.stop_dearpygui()
@@ -1938,7 +2270,10 @@ class MilluBridge:
         self.stop_media_sync = True
         self.stop_running_state = True
         self.stop_simulation_clock = True
+        self.stop_dali_scan = True
         self.simulation_clock_running = False
+        if self.dali_manager:
+            self.dali_manager.stop_monitoring_thread()
         if self.is_running:
             self.stop_bridge()
         
