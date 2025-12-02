@@ -30,6 +30,8 @@ import tempfile
 import requests
 
 
+VERSION = "1.1"
+
 PERSIST_SETTINGS = False  # Toggle when external config storage becomes safe again
 
 
@@ -347,8 +349,14 @@ class MilluBridge:
         with dpg.window(label="MilluBridge - OSC to MIDI Bridge", tag="primary_window", 
                        width=900, height=700, no_close=True):
             
-            # OSC Settings section
-            dpg.add_text("Millumin Settings", color=(150, 200, 255))
+            # Header with version in top right
+            with dpg.table(header_row=False, borders_innerH=False, borders_innerV=False, 
+                          borders_outerH=False, borders_outerV=False):
+                dpg.add_table_column(width_stretch=True)
+                dpg.add_table_column(width_fixed=True)
+                with dpg.table_row():
+                    dpg.add_text("Millumin Settings", color=(150, 200, 255))
+                    dpg.add_text(f"v{VERSION}", color=(120, 120, 120))
             with dpg.group(horizontal=True):
                 dpg.add_text("OSC Address:")
                 dpg.add_input_text(tag="osc_address_input", default_value=self.osc_address, 
