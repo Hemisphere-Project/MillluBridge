@@ -14,7 +14,7 @@ maintainers = [
 ]
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 keywords = ["osc", "midi", "bridge", "media", "sync", "millumin"]
 classifiers = [
     "Development Status :: 4 - Beta",
