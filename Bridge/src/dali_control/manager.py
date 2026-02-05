@@ -199,8 +199,9 @@ class DaliManager:
         
         try:
             with self.driver_lock:
-                # Send broadcast command: RecallMaxLevel (ON)
-                cmd = RecallMaxLevel(Broadcast())
+                # Send broadcast DAPC command to set all lights to max (254)
+                # Using DAPC is more reliable than RecallMaxLevel as it directly sets the level
+                cmd = DAPC(Broadcast(), 254)
                 self.driver.send(cmd)
             print("[DALI] Broadcast: All On")
             return True
@@ -216,8 +217,9 @@ class DaliManager:
         
         try:
             with self.driver_lock:
-                # Send broadcast Off command
-                cmd = Off(Broadcast())
+                # Send broadcast DAPC command to set all lights to 0
+                # Using DAPC is more reliable as it directly sets the level
+                cmd = DAPC(Broadcast(), 0)
                 self.driver.send(cmd)
             print("[DALI] Broadcast: Blackout (Off)")
             return True

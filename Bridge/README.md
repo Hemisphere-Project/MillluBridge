@@ -142,6 +142,89 @@ Edit `config.json` to configure:
 - Media sync parameters
 - RF simulation settings
 
+## 🎬 Millumin Setup
+
+MilluBridge works with Millumin in **Dashboard mode only**. Timeline mode is not yet supported because Millumin does not provide OSC feedback about media status and position when using timelines.
+
+### Enable OSC Feedback in Millumin
+
+1. Open Millumin and go to **Interact > Device Manager** (⌘D)
+2. Click the **+** button and add an **OSC** device
+3. Configure the OSC output:
+   - **Host**: `127.0.0.1` (if MilluBridge runs on the same machine)
+   - **Port**: `8000` (default MilluBridge OSC port)
+4. Enable **OSC Feedback** to send layer state updates
+
+### Setting Up Video Layers (Canvas Layers)
+
+To synchronize video playback with remote Nowde devices:
+
+1. **Create a Canvas Layer** in Millumin's Dashboard
+2. **Name the layer** with the exact name that matches your Nowde device configuration
+   - Example: `Layer1`, `MainVideo`, `Background`
+3. **Add media** to the layer by dragging video files into it
+4. **Media naming convention**: Prefix your media files with a number (1-127) followed by underscore
+   - Example: `001_intro.mov`, `042_main_sequence.mp4`, `100_outro.mov`
+   - The number becomes the media index sent to remote Nowde devices
+
+**In MilluBridge UI:**
+- The **Millumin Layers** table shows all detected layers with their current state
+- **State**: `playing`, `paused`, or `stopped`
+- **Filename**: Currently loaded media file
+- **Position/Duration**: Playback progress
+
+### Setting Up Light Layers (DALI Control)
+
+To control DALI lights via the Hasseb DALI Master USB:
+
+1. **Create a Data Layer** in Millumin's Dashboard
+2. **Configure the Data Layer**:
+   - **Mode**: `OSC`
+   - **Method**: `Continuous`
+   - **Address**: `/L{channel}` where `{channel}` is 1-16
+     - Example: `/L1` for DALI channel 1, `/L7` for channel 7
+   - **Range**: `0` to `255` (DALI brightness range)
+3. **Add a value/gradient** to control the light level
+   - Drag a color/gradient or use the data layer's built-in controls
+   - The value (0-255) is sent continuously to the DALI device
+
+**In MilluBridge UI:**
+- The **MilluBridge Lights** table shows all light channels receiving data
+- **Channel**: Light address (L1-L16)
+- **Value**: Current brightness level (0-255)
+- **Status**:
+  - `OK` (green): DALI device detected and responding
+  - `No Response` (orange): No DALI device at this address
+  - `...` (grey): Scanning in progress
+
+**Testing lights:**
+- Click on a channel name (e.g., `L7`) in the table to **identify** it (device will blink)
+- Use **All On** button to set all lights to full brightness
+- Use **Blackout** button to turn off all lights
+
+### Understanding the MilluBridge Display
+
+| Section | What it shows |
+|---------|---------------|
+| **OSC Status** | Green checkmark = receiving OSC from Millumin |
+| **Millumin Layers** | Video layers with playback state, media name, position |
+| **MilluBridge Lights** | DALI light channels with values and device status |
+| **Local Nowde** | USB-connected Nowde device status and firmware version |
+| **Dali Master** | Hasseb DALI USB device connection status |
+| **Remote Nowdes** | ESP-NOW mesh network devices and their assigned layers |
+
+### Verifying Communication
+
+1. **OSC from Millumin**: Check the OSC status indicator turns green when Millumin is running
+2. **Light control working**: 
+   - Change a Data Layer value in Millumin
+   - The corresponding light channel value should update in MilluBridge
+   - The physical light should respond (if DALI device is connected)
+3. **Video sync working**:
+   - Play a media in a Canvas Layer
+   - The layer should appear in the Millumin Layers table with `playing` state
+   - Position should increment as playback progresses
+
 ## 🐛 Troubleshooting
 
 ### UV not found
