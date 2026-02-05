@@ -31,7 +31,7 @@ import tempfile
 import requests
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 PERSIST_SETTINGS = False  # Toggle when external config storage becomes safe again
 
@@ -467,7 +467,7 @@ class MilluBridge:
             # Split layout: Local Nowde (left 3/4) and Dali Master (right 1/4)
             with dpg.group(horizontal=True):
                 # Left 2/3 - Local Nowde section
-                with dpg.child_window(width=-250, height=220, border=False):
+                with dpg.child_window(width=-250, height=120, border=False):
                     dpg.add_text("Local Nowde", color=(150, 200, 255))
                     # Nowde device selection
                     with dpg.group(horizontal=True):
@@ -494,7 +494,7 @@ class MilluBridge:
                     dpg.add_text("", tag="firmware_upload_status", color=(150, 150, 150))
                 
                 # Right 1/3 - Dali Master section
-                with dpg.child_window(width=-1, height=220, border=False):
+                with dpg.child_window(width=-1, height=120, border=False):
                     dpg.add_text("Dali Master", color=(150, 200, 255))
                     
                     # DALI status
