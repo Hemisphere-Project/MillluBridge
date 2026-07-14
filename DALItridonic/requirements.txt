@@ -1,0 +1,4 @@
+dearpygui
+python-dali
+hidapi
+pyusb

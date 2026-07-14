@@ -1,0 +1,15 @@
+[project]
+name = "dali-controller"
+version = "0.1.0"
+description = "A GUI controller for Hasseb DALI Master using python-dali and Dear PyGui"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "dearpygui",
+    "python-dali",
+    "hidapi",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
